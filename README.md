@@ -1,72 +1,104 @@
 # oxideav-vulkan-video
 
-Vulkan Video hardware decode/encode bridge for the [oxideav](https://github.com/OxideAV/oxideav) framework. Builds on **Linux and Windows**.
+Vulkan Video hardware decode/encode bridge for the
+[oxideav](https://github.com/OxideAV/oxideav) framework. Builds on
+**Linux and Windows**.
 
 ## Why a bridge crate?
 
-The Vulkan Video extension family (`VK_KHR_video_queue`, `VK_KHR_video_decode_h264`, `VK_KHR_video_decode_h265`, `VK_KHR_video_decode_av1`, `VK_KHR_video_encode_*`) is the **vendor- and OS-neutral** path forward for HW acceleration. Unlike VA-API (Intel/AMD-leaning, Linux-only) and NVENC (NVIDIA-only), Vulkan Video is implemented in the Vulkan ICD layer itself and is gradually shipping across all three major GPU vendors on both Linux and Windows. As of 2025, decode is widely available; encode is rolling out.
+The Vulkan Video extension family (`VK_KHR_video_queue`,
+`VK_KHR_video_decode_h264`, `VK_KHR_video_decode_h265`,
+`VK_KHR_video_decode_av1`, `VK_KHR_video_encode_*`) is the vendor- and
+OS-neutral path for HW acceleration. Unlike VA-API (Linux-only) and
+NVENC (single-vendor), Vulkan Video is implemented in the Vulkan ICD
+layer itself and ships across all three major GPU vendors on both Linux
+and Windows. Decode is widely available today; encode is rolling out.
 
-This crate is a **thin runtime-loaded bridge** — no compile-time link dependency on the Vulkan loader or any vendor ICD. The loader is opened via [`libloading`] on first use:
+This crate is a **thin runtime-loaded bridge** — no compile-time link
+dependency on the Vulkan loader or any vendor ICD. The loader is opened
+via [`libloading`] on first use:
 
 | Platform | Loader filename |
 |----------|-----------------|
 | Linux    | `libvulkan.so.1` |
 | Windows  | `vulkan-1.dll`   |
 
-On Windows the loader is installed by the Vulkan SDK, by GPU driver packages (NVIDIA, AMD, Intel), and by Windows itself on recent builds.
+On Windows the loader is installed by the Vulkan SDK, by GPU driver
+packages, and by recent Windows builds.
 
 ## Programming model
 
-Vulkan is unusual in that **only `vkGetInstanceProcAddr` is meaningfully resolved by `dlsym`**. Every other Vulkan function — including all video extension entry points (`vkCmdBeginVideoCodingKHR`, `vkGetVideoSessionMemoryRequirementsKHR`, …) — is reached via `vkGetInstanceProcAddr` (instance-level entries) or `vkGetDeviceProcAddr` (device-level entries) after a `VkInstance` is created. So this crate's bootstrap vtable is intentionally tiny:
+Only `vkGetInstanceProcAddr` is meaningfully resolved by `dlsym`. Every
+other Vulkan function — including all video extension entry points
+(`vkCmdBeginVideoCodingKHR`, `vkGetVideoSessionMemoryRequirementsKHR`,
+…) — is reached via `vkGetInstanceProcAddr` (instance-level) or
+`vkGetDeviceProcAddr` (device-level) after a `VkInstance` is created. So
+the crate's bootstrap vtable is intentionally tiny:
 
 * `vkGetInstanceProcAddr`
 * `vkCreateInstance`
 * `vkEnumerateInstanceExtensionProperties`
 * `vkEnumerateInstanceVersion`
 
-As of Round 2, the crate uses these to construct a `VkInstance`, enumerate physical devices, and probe the `VK_KHR_video_*` extension family. Every other Vulkan entry is resolved on demand through `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr`.
+These construct a `VkInstance`, enumerate physical devices, and probe
+the `VK_KHR_video_*` extension family. Every other Vulkan entry is
+resolved on demand.
 
 ## Fallback behaviour
 
-Two distinct failure paths fall back automatically to the pure-Rust codec:
+Two distinct failure paths fall back automatically to the pure-Rust
+codec:
 
-1. **Load failure** — Vulkan loader not installed, no Vulkan ICD on the system (e.g. headless Linux CI without Mesa, Windows host without GPU driver). `register()` logs and returns without registering.
-2. **Init failure** — `vkCreateInstance` succeeds but `vkEnumerateDeviceExtensionProperties` reports the requested `VK_KHR_video_*` extension is unsupported by every available `VkPhysicalDevice`, or the queue family for video-decode/encode operations is missing. The factory returns `Err`; the registry falls back to the next-priority impl.
+1. **Load failure** — no Vulkan loader / ICD on the system. `register()`
+   logs and returns without registering.
+2. **Init failure** — `vkCreateInstance` succeeds but no
+   `VkPhysicalDevice` advertises the requested `VK_KHR_video_*`
+   extension, or the video-decode/encode queue family is missing. The
+   factory returns `Err`; the registry falls back to the next-priority
+   impl.
 
-Pipelines that **require** hardware can opt out of the SW fallback by setting `CodecPreferences { require_hardware: true, .. }`.
+Pipelines that **require** hardware opt out of the SW fallback by
+setting `CodecPreferences { require_hardware: true, .. }`.
 
 ## Platform gating
 
-The whole crate is `#![cfg(any(target_os = "linux", target_os = "windows"))]`. On macOS it compiles to an empty rlib; the umbrella `oxideav` crate gates the `register` call behind the same cfg. (Vulkan is reachable on macOS via MoltenVK but with a different loading story — out of scope for now.)
+The whole crate is `#![cfg(any(target_os = "linux", target_os =
+"windows"))]`. On macOS it compiles to an empty rlib; the umbrella
+`oxideav` crate gates the `register` call behind the same cfg. (Vulkan
+is reachable on macOS via MoltenVK with a different loading story — out
+of scope.)
 
-## Priority
+## Priority and opt-out
 
-Hardware factories register with `CodecCapabilities::with_priority(20)` — slightly higher (worse) than VA-API's 10 and NVENC's 5, because Vulkan Video drivers are still maturing and the per-vendor implementation quality varies. As stability improves we will lower the priority number.
+Hardware factories register with `CodecCapabilities::with_priority(20)`
+— slightly higher (worse) than VA-API (10) and NVENC (5), reflecting
+that Vulkan Video driver maturity varies by vendor. `--no-hwaccel` on
+the `oxideav` CLI biases dispatch away from HW factories without
+unregistering them.
 
-## Opt-out
+## Coverage
 
-`--no-hwaccel` on the `oxideav` CLI biases dispatch away from HW factories without unregistering them.
+| Codec | Decode | Encode |
+|-------|--------|--------|
+| H.264 | Full pipeline wired end-to-end (session + parameters, DPB NV12 image, bitstream/staging buffers, command recording, NV12 readback); validation-clean | planned |
+| HEVC  | Capability query wired; session/decode pipeline planned | planned |
+| AV1   | Capability query wired; session/decode pipeline planned | planned |
+| VP9   | — | — |
 
-## Coverage roadmap
-
-| Codec        | Decode                                                         | Encode |
-|--------------|----------------------------------------------------------------|--------|
-| H.264        | wired end-to-end (validation-clean after Round 4 5-VUID fix)   | planned |
-| HEVC         | capability query wired; session/decode pipeline planned        | planned |
-| AV1          | capability query wired; session/decode pipeline planned        | planned |
-| VP9          | —                                                              | — |
-
-Round 9 (this commit): six new pure-function labelers — `h264_profile_label` / `h264_level_label` / `h265_profile_label` / `h265_level_label` / `av1_profile_label` / `av1_level_label` — turn the raw `StdVideo*Profile`/`StdVideo*Level` `i32` values into the canonical spec labels (`"High"`, `"Main 10"`, `"5.1"`, `"6.3"`, …). Wired into `engine.rs` so each `HwCodecCaps` row published by `engine_info()` carries a `max_level` (H.264/H.265) or `max_level_label` (AV1) extras entry alongside the existing raw IDC values, and the `profiles` vector now routes through the labeler instead of the previously-hard-coded `"High"` / `"Main"` literals. 12 new unit tests cover every recognised `STD_VIDEO_*` constant and the `unknown(N)` fall-through.
-
-Round 8: `engine_info()` now populates `max_width` / `max_height` / `max_dpb_slots` / `max_active_reference_pictures` / `max_level_idc` (H.265) / `max_level` (AV1) / `std_header_version` for the HEVC and AV1 rows. Two new public capability queries — `query_video_decode_h265_capabilities` (H.265 Main, 8-bit 4:2:0) and `query_video_decode_av1_capabilities` (AV1 Main, 8-bit 4:2:0, film-grain opt-out) — chain `VkVideoProfileInfoKHR → VkVideoDecodeH265ProfileInfoKHR` / `VkVideoDecodeAV1ProfileInfoKHR` and a matching three-level output chain through `VkVideoCapabilitiesKHR → VkVideoDecodeCapabilitiesKHR → VkVideoDecodeH265CapabilitiesKHR` / `VkVideoDecodeAV1CapabilitiesKHR`. `sys.rs` gains the four sType discriminants, two `Std*` typedefs each for H.265 (`ProfileIdc` / `LevelIdc`) and AV1 (`Profile` / `Level`), profile/level constants (Main / Main-10 / Still-Picture / FRExt / SCC for H.265; Main / High / Professional for AV1; 5.1 and 6.2/6.3 anchor-level values), and `VK_STD_VULKAN_VIDEO_CODEC_{H265,AV1}_DECODE_{EXTENSION_NAME,SPEC_VERSION}` constants. Struct sizes (24 B each) + every field offset are cross-checked against the C ABI in `tests/struct_sizes.rs`. Integration test `tests/round8_hevc_av1_caps.rs` skips gracefully when no Vulkan ICD or no per-codec extension is present.
-
-Round 4: the full H.264 decode pipeline is wired through `vkEndCommandBuffer` — instance, device, video session + parameters object loaded with parsed SPS+PPS, DPB image (NV12 layout, multi-layer), host-visible bitstream + staging buffers, command pool + buffer, image-layout barriers, `vkCmdBeginVideoCodingKHR` / `vkCmdControlVideoCodingKHR` (RESET) / `vkCmdDecodeVideoKHR` / `vkCmdEndVideoCodingKHR` recording, and `vkCmdCopyImageToBuffer` for NV12 readback. After the Round 4 5-VUID fix (CHANGELOG), the decode runs cleanly end-to-end on the dev box (RTX 5080, driver 580.95.05) and the decoded NV12 frame matches the reference YUV bit-for-bit (mean abs diff = 0.00/255).
-
-Round 2: the bootstrap → `VkInstance` → `VkPhysicalDevice` → `VK_KHR_video_*` extension probe path is plumbed end-to-end. `Instance::new("oxideav-vulkan-video-test", VK_API_VERSION_1_2)` calls `vkCreateInstance`, resolves the post-bootstrap function pointers through `vkGetInstanceProcAddr`, and exposes safe wrappers for `vkEnumeratePhysicalDevices`, `vkGetPhysicalDeviceProperties`, `vkEnumerateDeviceExtensionProperties`, and `vkGetPhysicalDeviceQueueFamilyProperties2` (the `_2` form gives a `pNext` chain into `VkQueueFamilyVideoPropertiesKHR`). `PhysicalDevice::supports_video_extensions()` returns a per-codec bool summary (queue_khr, decode_h264, decode_h265, decode_av1, encode_h264, encode_h265). Verified on an NVIDIA RTX 5080 with driver 580.95.05 in `tests/round2_init.rs`: every codec extension above is advertised and 2 queue families carry `VK_QUEUE_VIDEO_DECODE_BIT_KHR` / `VK_QUEUE_VIDEO_ENCODE_BIT_KHR`. `register()` remains a graceful no-op — Round 3 will layer the first decode session (H.264 / HEVC) on top.
+Capability queries (`query_video_decode_h264/h265/av1_capabilities`)
+chain the per-codec `VkVideoProfileInfoKHR` / `VkVideoCapabilitiesKHR`
+structures and populate `engine_info()` rows with max dimensions, DPB
+slots, reference-picture counts, level, and canonical profile/level
+labels. Struct sizes and field offsets are cross-checked against the C
+ABI in `tests/struct_sizes.rs`; integration tests skip gracefully when
+no Vulkan ICD or per-codec extension is present.
 
 ## Workspace policy
 
-Calling a system OS / driver API via FFI is the same shape as calling `libc::malloc` — it's the platform, not a copied algorithm. The workspace's clean-room rule (no embedding source from libvpx, libwebp, libjxl, etc.) does not apply to this crate.
+Calling a system OS / driver API via FFI is the same shape as calling
+`libc::malloc` — it's the platform, not a copied algorithm. The
+workspace's clean-room rule (no embedding source from external codec
+libraries) does not apply to this crate.
 
 ## License
 
