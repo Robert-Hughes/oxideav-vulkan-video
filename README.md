@@ -1,5 +1,7 @@
 # oxideav-vulkan-video
 
+[![CI](https://github.com/OxideAV/oxideav-vulkan-video/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-vulkan-video/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-vulkan-video.svg)](https://crates.io/crates/oxideav-vulkan-video) [![docs.rs](https://docs.rs/oxideav-vulkan-video/badge.svg)](https://docs.rs/oxideav-vulkan-video) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Vulkan Video hardware decode/encode bridge for the
 [oxideav](https://github.com/OxideAV/oxideav) framework. Builds on
 **Linux and Windows**.
