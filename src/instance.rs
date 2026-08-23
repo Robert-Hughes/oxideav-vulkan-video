@@ -80,6 +80,12 @@ impl std::error::Error for VkError {}
 pub struct Instance {
     handle: VkInstance,
     fns: InstanceFns,
+    /// Whether `Drop` should call `vkDestroyInstance`. `true` for
+    /// instances built by [`Instance::new`]; `false` for foreign
+    /// handles imported via [`Instance::from_raw`] /
+    /// [`Instance::from_raw_with_loader`] — those are owned by the
+    /// caller and must be destroyed by the caller.
+    owned: bool,
 }
 
 /// Function pointers resolved via `vkGetInstanceProcAddr`. These are
@@ -185,7 +191,89 @@ impl Instance {
         Ok(Self {
             handle: instance,
             fns,
+            owned: true,
         })
+    }
+
+    /// Import a foreign `VkInstance` created by the application (e.g.
+    /// through `ash`, `vulkano`, `wgpu`, or hand-rolled FFI) instead
+    /// of creating a new one.
+    ///
+    /// The returned wrapper is **non-owning**: `Drop` does *not* call
+    /// `vkDestroyInstance` — the caller keeps ownership and destroys
+    /// the instance after every object derived from this wrapper is
+    /// gone. Function pointers are resolved through the system Vulkan
+    /// loader's `vkGetInstanceProcAddr` (the same loader
+    /// [`Instance::new`] uses); if the application obtained its
+    /// instance from a non-standard loader, use
+    /// [`Instance::from_raw_with_loader`] and pass that loader's
+    /// `vkGetInstanceProcAddr` explicitly.
+    ///
+    /// Returns `VkError::LoaderUnavailable` if the system loader
+    /// can't be opened, or `VkError::MissingFunction` if a required
+    /// entry point can't be resolved against the handle.
+    ///
+    /// # Safety
+    ///
+    /// * `handle` must be a valid, live `VkInstance` created against
+    ///   the system Vulkan loader.
+    /// * The instance must support Vulkan 1.1+ (the crate uses
+    ///   `vkGetPhysicalDeviceQueueFamilyProperties2`, core in 1.1).
+    /// * The instance must outlive the returned wrapper and every
+    ///   object derived from it.
+    /// * Vulkan instances are externally synchronised: the caller
+    ///   must not destroy or mutate the instance concurrently with
+    ///   calls through this wrapper.
+    pub unsafe fn from_raw(handle: VkInstance) -> Result<Self, VkError> {
+        let vt = sys::vtable().map_err(|e| VkError::LoaderUnavailable(e.to_string()))?;
+        // SAFETY: forwarded caller contract.
+        unsafe { Self::from_raw_with_loader(handle, vt.vk_get_instance_proc_addr) }
+    }
+
+    /// Like [`Instance::from_raw`], but resolves every function
+    /// pointer through a caller-supplied `vkGetInstanceProcAddr`
+    /// instead of the system loader's. Use this when the application
+    /// links Vulkan statically or loads it through its own mechanism
+    /// (e.g. `ash::Entry::load` on a custom path).
+    ///
+    /// The returned wrapper is non-owning; see [`Instance::from_raw`]
+    /// for the full contract.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Instance::from_raw`], plus:
+    /// `get_instance_proc_addr` must be the genuine
+    /// `vkGetInstanceProcAddr` of the loader `handle` was created
+    /// with.
+    pub unsafe fn from_raw_with_loader(
+        handle: VkInstance,
+        get_instance_proc_addr: sys::FnVkGetInstanceProcAddr,
+    ) -> Result<Self, VkError> {
+        let fns = InstanceFns::resolve(get_instance_proc_addr, handle)?;
+        Ok(Self {
+            handle,
+            fns,
+            owned: false,
+        })
+    }
+
+    /// Wrap a foreign `VkPhysicalDevice` handle that belongs to this
+    /// instance, without going through
+    /// [`Instance::physical_devices`] enumeration.
+    ///
+    /// Physical-device handles are not owned objects in Vulkan, so
+    /// there is nothing to destroy; the returned wrapper simply
+    /// borrows `self`'s dispatch table.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be a valid `VkPhysicalDevice` enumerated from
+    /// the *same* `VkInstance` this wrapper holds.
+    pub unsafe fn physical_device_from_raw(
+        &self,
+        handle: crate::sys::VkPhysicalDevice,
+    ) -> PhysicalDevice<'_> {
+        PhysicalDevice::from_raw(handle, &self.fns)
     }
 
     /// Raw handle. For interop with hand-rolled FFI; the safe API
@@ -238,7 +326,7 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        if self.owned && !self.handle.is_null() {
             // SAFETY: handle was created by `vkCreateInstance` and
             // has not been previously destroyed; no objects derived
             // from it are still live (the borrow checker prevents

@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Round 10 import an existing Vulkan device (#2)
+
+Applications that already own a Vulkan device (a renderer, a compute
+pipeline, …) can now run H.264 decode on it instead of letting the
+crate create its own instance / device — requested in GitHub issue
+[#2](https://github.com/OxideAV/oxideav-vulkan-video/issues/2).
+
+- `ExternalDevice` (re-exported at crate root): a `Copy` bundle of
+  the application's raw `VkInstance` / `VkPhysicalDevice` /
+  `VkDevice` handles plus the video queue to submit on
+  (`queue_family_index`, `queue_index`) and an optional
+  `vkGetInstanceProcAddr` for non-standard loaders. Builder helpers:
+  `ExternalDevice::new`, `with_queue_index`,
+  `with_get_instance_proc_addr`; `unsafe fn import()` wraps the
+  handles into the crate's non-owning `Instance` / `Device`.
+- `unsafe fn H264VkDecoder::make_with_device(&CodecParameters,
+  ExternalDevice)` (`registry` feature): the framework-decoder twin
+  of `make` that builds the whole lazy pipeline (video session,
+  session parameters, DPB / output images, buffers, command pool) on
+  the imported device. `CodecParameters::device_index` is ignored on
+  this path — the device is the caller's choice. Nothing in `Drop`
+  destroys the imported handles; only the objects the decoder
+  created on top of them are torn down. The imported queue family is
+  validated video-capable up front (`Error::Unsupported` with a
+  clear diagnostic otherwise), and a device created without the
+  required video extensions surfaces as a `MissingFunction` error at
+  dispatch-resolution time instead of undefined behavior.
+- Non-owning low-level wrappers, usable without the `registry`
+  feature: `unsafe fn Instance::from_raw(VkInstance)` (system
+  loader), `unsafe fn Instance::from_raw_with_loader(VkInstance,
+  FnVkGetInstanceProcAddr)` (caller-supplied loader), `unsafe fn
+  Instance::physical_device_from_raw(VkPhysicalDevice)`, and
+  `unsafe fn Device::from_raw(&PhysicalDevice, VkDevice)`. Both
+  wrapper types grew an internal `owned` flag; `Drop` skips
+  `vkDestroyInstance` / `vkDestroyDevice` for imported handles.
+- `Device::queue_indexed(family_index, queue_index)`: like
+  `Device::queue` (which is now a thin `queue_indexed(family, 0)`
+  forwarder) but honours a non-zero queue index, for applications
+  that reserve queue 0 of the family for their own submissions. The
+  decoder's submit + wait-idle paths now go through the configured
+  queue index.
+- Internals: `DecoderState::create` split into the self-created
+  path (`create`), the imported path (`create_external`), and the
+  shared pipeline-construction tail (`build`); `DecoderState` /
+  `H264VkDecoder` carry the new `queue_index` / `external` fields.
+- Tests: `tests/round10_external_device.rs` — non-owning `Drop`
+  proofs for both wrappers (original instance / device stay usable
+  after the imported wrapper drops), full pipeline construction on
+  an imported device under the round-4/7 `OXIDEAV_VK_SKIP_SUBMIT`
+  hook including handle survival after decoder `Drop`, and the
+  bogus-queue-family rejection diagnostic. Same skip-on-no-Vulkan
+  policy as earlier rounds.
+
 ### Added — Round 9 typed profile / level labelers
 
 - Six new pure-function public APIs in `video.rs` that turn raw

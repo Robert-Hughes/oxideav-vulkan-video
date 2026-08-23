@@ -69,7 +69,7 @@ use oxideav_bitstream::h264::{
     NAL_TYPE_SPS,
 };
 
-use crate::device::Device;
+use crate::device::{Device, ExternalDevice};
 use crate::instance::Instance;
 use crate::physical_device::{
     PhysicalDevice, PhysicalDeviceType, VK_KHR_SYNCHRONIZATION_2_NAME,
@@ -272,6 +272,10 @@ struct DecoderState {
     session: Option<VideoSession<'static>>,
 
     queue_family_index: u32,
+    /// Which queue within `queue_family_index` submissions go to.
+    /// Always `0` for the self-created path; imported devices
+    /// ([`ExternalDevice::queue_index`]) may pick another queue.
+    queue_index: u32,
     /// Held for diagnostics / future round expansion.
     #[allow(dead_code)]
     physical_device_handle: sys::VkPhysicalDevice,
@@ -334,7 +338,11 @@ impl Drop for DecoderState {
         // NVIDIA's session destructor is sensitive to in-flight
         // command buffers referencing the bound DPB.
         unsafe {
-            (dfns.queue_wait_idle)(self.device.queue(self.queue_family_index).handle());
+            (dfns.queue_wait_idle)(
+                self.device
+                    .queue_indexed(self.queue_family_index, self.queue_index)
+                    .handle(),
+            );
         }
 
         // Tear down in spec order:
@@ -474,6 +482,11 @@ pub struct H264VkDecoder {
     /// into the same filtered physical-device list that
     /// [`crate::engine_info`] reports.
     device_index: u32,
+    /// Application-supplied Vulkan handles to run on instead of
+    /// creating our own instance / device. `None` for the registry
+    /// path ([`H264VkDecoder::make`]); `Some` when constructed via
+    /// [`H264VkDecoder::make_with_device`].
+    external: Option<ExternalDevice>,
 }
 
 impl H264VkDecoder {
@@ -502,6 +515,62 @@ impl H264VkDecoder {
             output_queue: VecDeque::new(),
             flushed: false,
             device_index,
+            external: None,
+        }))
+    }
+
+    /// Construct a decoder that runs on an **application-owned**
+    /// Vulkan device instead of creating its own instance / device
+    /// (GitHub issue #2). Use this when your program already has a
+    /// `VkInstance` / `VkDevice` (renderer, compute app, …) and you
+    /// want video decode to share it.
+    ///
+    /// The heavy pipeline objects (video session, session parameters,
+    /// DPB / output images, buffers, command pool) are still created
+    /// lazily on the first SPS+PPS pair, exactly like the registry
+    /// path — but on `external.device`, submitting to queue
+    /// `external.queue_index` of `external.queue_family_index`.
+    /// [`CodecParameters::device_index`] is ignored (the device is
+    /// yours, there is nothing to select).
+    ///
+    /// Nothing in the decoder's `Drop` destroys the imported
+    /// instance / device; only the objects the decoder created on
+    /// top of them are torn down.
+    ///
+    /// # Safety
+    ///
+    /// * Every handle in `external` must be valid and mutually
+    ///   consistent: `device` created from `physical_device`, itself
+    ///   enumerated from `instance`.
+    /// * The handles must outlive the returned decoder: drop the
+    ///   decoder before destroying the device / instance. (Output
+    ///   frames are host-side copies and carry no Vulkan lifetime.)
+    /// * The device must have been created with
+    ///   `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`,
+    ///   `VK_KHR_video_decode_h264` and — below Vulkan 1.3 —
+    ///   `VK_KHR_synchronization2` enabled, and with at least
+    ///   `external.queue_index + 1` queues in
+    ///   `external.queue_family_index` (a family advertising
+    ///   `VK_QUEUE_VIDEO_DECODE_BIT_KHR`).
+    /// * The decoder submits to — and waits idle on — that queue;
+    ///   the queue must not be used from other threads concurrently
+    ///   with `send_packet` / the decoder's `Drop`.
+    /// * If the instance was not created through the system Vulkan
+    ///   loader, `external.get_instance_proc_addr` must be set.
+    pub unsafe fn make_with_device(
+        params: &CodecParameters,
+        external: ExternalDevice,
+    ) -> Result<Box<dyn oxideav_core::Decoder>> {
+        let _ = params.device_index; // documented as ignored
+        Ok(Box::new(H264VkDecoder {
+            codec_id: CodecId::new("h264"),
+            state: None,
+            sps_nals: Vec::new(),
+            pps_nals: Vec::new(),
+            output_queue: VecDeque::new(),
+            flushed: false,
+            device_index: 0,
+            external: Some(external),
         }))
     }
 
@@ -509,7 +578,10 @@ impl H264VkDecoder {
         if self.state.is_some() {
             return Ok(());
         }
-        let st = DecoderState::create(sps, pps, self.device_index)?;
+        let st = match &self.external {
+            Some(ext) => DecoderState::create_external(sps, pps, ext)?,
+            None => DecoderState::create(sps, pps, self.device_index)?,
+        };
         self.state = Some(st);
         Ok(())
     }
@@ -700,6 +772,113 @@ impl DecoderState {
         // using `instance` later.
         drop(devices);
 
+        // ── Device ──────────────────────────────────────────────
+        // We re-enumerate one more time and create the Device.
+        let pds = instance
+            .physical_devices()
+            .map_err(|e| Error::unsupported(format!("vulkan-video: physical_devices2: {e}")))?;
+        let pd = pds
+            .iter()
+            .find(|p| p.handle() == pd_handle)
+            .ok_or_else(|| Error::other("vulkan-video: pd lookup2 failed"))?;
+        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
+            eprintln!("vulkan-video: creating device");
+        }
+        let device = Device::new(
+            pd,
+            qfi,
+            &[
+                // VK_KHR_video_queue is specified in terms of sync2
+                // stage / access bits, so the loader's validation
+                // requires sync2 to be enabled alongside it
+                // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+                // sync2 is core in Vulkan 1.3 but Round 2+ requests
+                // 1.2 explicitly, so we list it by name here.
+                VK_KHR_SYNCHRONIZATION_2_NAME,
+                VK_KHR_VIDEO_QUEUE_NAME,
+                VK_KHR_VIDEO_DECODE_QUEUE_NAME,
+                VK_KHR_VIDEO_DECODE_H264_NAME,
+            ],
+        )
+        .map_err(|e| Error::unsupported(format!("vulkan-video: vkCreateDevice: {e}")))?;
+        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
+            eprintln!("vulkan-video: device OK");
+        }
+        drop(pds);
+
+        Self::build(sps, pps, instance, pd_handle, qfi, 0, device)
+    }
+
+    /// Construct the decode pipeline on an application-supplied
+    /// device ([`ExternalDevice`]) instead of creating our own
+    /// instance / device (GitHub issue #2).
+    ///
+    /// The imported handles are wrapped non-owning — nothing in
+    /// `Drop` destroys the caller's instance or device; only the
+    /// objects this crate created on top of them (session, images,
+    /// buffers, command pool, …) are torn down.
+    ///
+    /// # Safety contract (discharged by `make_with_device`)
+    ///
+    /// The `ExternalDevice` handles were vouched for by the caller of
+    /// [`H264VkDecoder::make_with_device`]; see the contract there.
+    fn create_external(sps: &H264Sps, pps: &H264Pps, ext: &ExternalDevice) -> Result<Self> {
+        // SAFETY: handle validity / lifetime / synchronisation were
+        // guaranteed by the unsafe `make_with_device` caller.
+        let (instance, device) = unsafe { ext.import() }
+            .map_err(|e| Error::unsupported(format!("vulkan-video: import device: {e}")))?;
+
+        // Cheap sanity checks with clear diagnostics before we get
+        // deep into session construction.
+        {
+            // SAFETY: same caller contract — the physical device
+            // belongs to the imported instance.
+            let pd = unsafe { instance.physical_device_from_raw(ext.physical_device) };
+            let support = pd.supports_video_extensions();
+            if !support.queue_khr || !support.decode_h264 {
+                return Err(Error::unsupported(format!(
+                    "vulkan-video: imported device does not support H.264 decode \
+                     (queue_khr={} decode_h264={})",
+                    support.queue_khr, support.decode_h264
+                )));
+            }
+            if !pd
+                .video_queue_family_indices()
+                .contains(&ext.queue_family_index)
+            {
+                return Err(Error::unsupported(format!(
+                    "vulkan-video: imported queue_family_index {} is not video-capable",
+                    ext.queue_family_index
+                )));
+            }
+        }
+
+        Self::build(
+            sps,
+            pps,
+            instance,
+            ext.physical_device,
+            ext.queue_family_index,
+            ext.queue_index,
+            device,
+        )
+    }
+
+    /// Shared tail of [`DecoderState::create`] /
+    /// [`DecoderState::create_external`]: everything downstream of
+    /// having an `Instance`, a chosen physical device + video queue
+    /// family, and a `VkDevice` (owned or imported) — capability
+    /// query, video session + parameters, DPB / output images,
+    /// bitstream + staging buffers, command pool.
+    fn build(
+        sps: &H264Sps,
+        pps: &H264Pps,
+        instance: Instance,
+        pd_handle: sys::VkPhysicalDevice,
+        qfi: u32,
+        queue_index: u32,
+        device: Device,
+    ) -> Result<Self> {
         // ── Capabilities ────────────────────────────────────────
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
             eprintln!("vulkan-video: querying caps");
@@ -736,40 +915,6 @@ impl DecoderState {
             }
             p
         };
-        drop(pds);
-
-        // ── Device ──────────────────────────────────────────────
-        // We re-enumerate one more time and create the Device.
-        let pds = instance
-            .physical_devices()
-            .map_err(|e| Error::unsupported(format!("vulkan-video: physical_devices2: {e}")))?;
-        let pd = pds
-            .iter()
-            .find(|p| p.handle() == pd_handle)
-            .ok_or_else(|| Error::other("vulkan-video: pd lookup2 failed"))?;
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!("vulkan-video: creating device");
-        }
-        let device = Device::new(
-            pd,
-            qfi,
-            &[
-                // VK_KHR_video_queue is specified in terms of sync2
-                // stage / access bits, so the loader's validation
-                // requires sync2 to be enabled alongside it
-                // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
-                // sync2 is core in Vulkan 1.3 but Round 2+ requests
-                // 1.2 explicitly, so we list it by name here.
-                VK_KHR_SYNCHRONIZATION_2_NAME,
-                VK_KHR_VIDEO_QUEUE_NAME,
-                VK_KHR_VIDEO_DECODE_QUEUE_NAME,
-                VK_KHR_VIDEO_DECODE_H264_NAME,
-            ],
-        )
-        .map_err(|e| Error::unsupported(format!("vulkan-video: vkCreateDevice: {e}")))?;
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!("vulkan-video: device OK");
-        }
         drop(pds);
 
         // ── Video session ───────────────────────────────────────
@@ -1393,6 +1538,7 @@ impl DecoderState {
                 std::mem::transmute::<VideoSession<'_>, VideoSession<'static>>(video_session)
             }),
             queue_family_index: qfi,
+            queue_index,
             physical_device_handle: pd_handle,
             device,
             instance,
@@ -1855,7 +2001,9 @@ impl DecoderState {
         }
 
         // ── Submit ─────────────────────────────────────────────
-        let queue = self.device.queue(self.queue_family_index);
+        let queue = self
+            .device
+            .queue_indexed(self.queue_family_index, self.queue_index);
         let submit = VkSubmitInfo {
             s_type: VK_STRUCTURE_TYPE_SUBMIT_INFO,
             p_next: ptr::null(),

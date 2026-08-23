@@ -34,6 +34,27 @@
 //! bootstrap vtable is intentionally tiny; Round 2 will populate the
 //! post-instance dispatch surface.
 //!
+//! # Importing an existing device
+//!
+//! Applications that already own a Vulkan device (a renderer, a
+//! compute pipeline, …) can run decode on it instead of letting the
+//! crate create its own instance / device:
+//!
+//! * [`device::ExternalDevice`] bundles the raw
+//!   `VkInstance` / `VkPhysicalDevice` / `VkDevice` handles plus the
+//!   video queue (family, index) to submit on.
+//! * `decoder::H264VkDecoder::make_with_device` (behind the
+//!   default-on `registry` feature) builds a framework
+//!   `oxideav_core::Decoder` on those handles.
+//! * The lower-level non-owning wrappers — [`Instance::from_raw`],
+//!   [`Instance::from_raw_with_loader`],
+//!   [`Instance::physical_device_from_raw`], [`Device::from_raw`] —
+//!   are available for tooling that wants the raw bridge only.
+//!
+//! Imported handles are never destroyed by this crate; `Drop` only
+//! tears down the objects the crate created on top of them. See the
+//! safety contracts on each constructor.
+//!
 //! # Status
 //!
 //! Round 3 (this commit): adds [`device::Device`] (a logical
@@ -65,7 +86,7 @@ pub mod decoder;
 #[cfg(feature = "registry")]
 pub mod engine;
 
-pub use device::{Device, Queue};
+pub use device::{Device, ExternalDevice, Queue};
 pub use instance::{Instance, VkError};
 pub use physical_device::{PhysicalDevice, PhysicalDeviceProperties, VideoExtensionSupport};
 pub use video::{

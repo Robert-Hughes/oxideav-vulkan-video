@@ -59,6 +59,11 @@ const DEFAULT_QUEUE_PRIORITY: f32 = 1.0;
 pub struct Device {
     handle: VkDevice,
     fns: DeviceFns,
+    /// Whether `Drop` should call `vkDestroyDevice`. `true` for
+    /// devices built by [`Device::new`]; `false` for foreign handles
+    /// imported via [`Device::from_raw`] — those are owned by the
+    /// caller and must be destroyed by the caller.
+    owned: bool,
 }
 
 /// Function pointers resolved via `vkGetDeviceProcAddr` against a
@@ -225,6 +230,52 @@ impl Device {
         Ok(Self {
             handle: device,
             fns: device_fns,
+            owned: true,
+        })
+    }
+
+    /// Import a foreign `VkDevice` created by the application (e.g.
+    /// the same logical device a renderer built through `ash` /
+    /// `vulkano` / `wgpu`-hal) instead of creating a new one.
+    ///
+    /// The returned wrapper is **non-owning**: `Drop` does *not* call
+    /// `vkDestroyDevice` — the caller keeps ownership and destroys
+    /// the device after every object derived from this wrapper is
+    /// gone. The device-level dispatch table is resolved through the
+    /// parent instance's `vkGetDeviceProcAddr`, so `physical_device`
+    /// must come from the same [`crate::Instance`] wrapper the device
+    /// was created against (for imported instances, see
+    /// [`crate::Instance::from_raw`] and
+    /// [`crate::Instance::physical_device_from_raw`]).
+    ///
+    /// Returns `VkError::MissingFunction` if a required device entry
+    /// point can't be resolved — most commonly because the device was
+    /// created **without** the video extensions enabled. For H.264
+    /// decode the device needs at least `VK_KHR_video_queue`,
+    /// `VK_KHR_video_decode_queue`, `VK_KHR_video_decode_h264`, and
+    /// (below Vulkan 1.3) `VK_KHR_synchronization2`.
+    ///
+    /// # Safety
+    ///
+    /// * `handle` must be a valid, live `VkDevice` created from
+    ///   `physical_device`'s underlying `VkPhysicalDevice`, against
+    ///   the same instance `physical_device` borrows from.
+    /// * The device must outlive the returned wrapper and every
+    ///   object derived from it (video sessions, images, buffers,
+    ///   command pools, …).
+    /// * Logical devices are externally synchronised: the caller must
+    ///   not destroy the device — or submit to any queue this wrapper
+    ///   uses — concurrently with calls through the wrapper.
+    pub unsafe fn from_raw(
+        physical_device: &PhysicalDevice<'_>,
+        handle: VkDevice,
+    ) -> Result<Self, VkError> {
+        let fns = physical_device.instance_fns();
+        let device_fns = DeviceFns::resolve(fns.get_device_proc_addr, handle)?;
+        Ok(Self {
+            handle,
+            fns: device_fns,
+            owned: false,
         })
     }
 
@@ -244,11 +295,20 @@ impl Device {
     /// Retrieve queue 0 from `family_index`. Round 3 only ever
     /// requests one queue per family in [`Device::new`].
     pub fn queue(&self, family_index: u32) -> Queue {
+        self.queue_indexed(family_index, 0)
+    }
+
+    /// Retrieve queue `queue_index` from `family_index`. Useful for
+    /// imported devices ([`Device::from_raw`]) whose owner created
+    /// more than one queue in the family and reserves index 0 for
+    /// its own (e.g. graphics) submissions.
+    pub fn queue_indexed(&self, family_index: u32, queue_index: u32) -> Queue {
         let mut q: VkQueue = ptr::null_mut();
-        // SAFETY: `device` is a valid handle and `family_index` is
-        // assumed to match what was passed to `vkCreateDevice`. The
-        // call cannot fail under those preconditions.
-        unsafe { (self.fns.get_device_queue)(self.handle, family_index, 0, &mut q) }
+        // SAFETY: `device` is a valid handle and `(family_index,
+        // queue_index)` is assumed to match what was passed to
+        // `vkCreateDevice`. The call cannot fail under those
+        // preconditions.
+        unsafe { (self.fns.get_device_queue)(self.handle, family_index, queue_index, &mut q) }
         Queue {
             handle: q,
             family_index,
@@ -258,7 +318,7 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
+        if self.owned && !self.handle.is_null() {
             // SAFETY: the spec requires every child object (queues,
             // sessions, memory, …) to be destroyed before the device.
             // Outstanding child wrappers in this crate borrow `&Device`
@@ -408,5 +468,143 @@ impl DeviceFns {
                 wait_for_fences: load_device_fn(get_device_proc, device, b"vkWaitForFences\0")?,
             })
         }
+    }
+}
+
+// ─────────────────────────── ExternalDevice ──────────────────────────────────
+
+/// Raw handles describing an application-owned Vulkan device to run
+/// video decode on, instead of letting the crate create its own
+/// instance / device (GitHub issue #2).
+///
+/// Pass this to `H264VkDecoder::make_with_device` (with the
+/// default-on `registry` feature), or use the lower-level
+/// [`crate::Instance::from_raw`] / [`Device::from_raw`] wrappers
+/// directly.
+///
+/// # Requirements on the imported objects
+///
+/// * The instance must be Vulkan 1.1+ (the crate calls
+///   `vkGetPhysicalDeviceQueueFamilyProperties2`, core in 1.1).
+/// * The device must have been created with the video extensions
+///   enabled: `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`, the
+///   codec extension (`VK_KHR_video_decode_h264` for the H.264
+///   decoder), and — below Vulkan 1.3 — `VK_KHR_synchronization2`.
+/// * `queue_family_index` must name a queue family that advertises
+///   `VK_QUEUE_VIDEO_DECODE_BIT_KHR`, and the device must have been
+///   created with at least `queue_index + 1` queues in that family.
+///
+/// # Ownership & synchronisation
+///
+/// The application keeps ownership of all three handles; nothing in
+/// this struct is destroyed by the crate. The handles must stay valid
+/// for the whole lifetime of every wrapper / decoder constructed from
+/// them. The decoder submits to — and waits idle on — the named
+/// queue, so that queue must not be used concurrently from other
+/// threads while a decode call is in flight.
+#[derive(Clone, Copy)]
+pub struct ExternalDevice {
+    /// The application's `VkInstance`.
+    pub instance: crate::sys::VkInstance,
+    /// The `VkPhysicalDevice` the logical device was created from.
+    pub physical_device: crate::sys::VkPhysicalDevice,
+    /// The application's `VkDevice`.
+    pub device: VkDevice,
+    /// Index of a video-decode-capable queue family the device was
+    /// created with.
+    pub queue_family_index: u32,
+    /// Which queue within `queue_family_index` the decoder should
+    /// submit to. `0` unless the application reserves queue 0 of the
+    /// family for its own submissions.
+    pub queue_index: u32,
+    /// `vkGetInstanceProcAddr` of the loader the instance was created
+    /// with. `None` means "resolve through the system Vulkan loader"
+    /// (correct whenever the application itself went through
+    /// `libvulkan.so.1` / `vulkan-1.dll`, which is the overwhelmingly
+    /// common case — including `ash::Entry::load()`).
+    pub get_instance_proc_addr: Option<crate::sys::FnVkGetInstanceProcAddr>,
+}
+
+impl std::fmt::Debug for ExternalDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalDevice")
+            .field("instance", &self.instance)
+            .field("physical_device", &self.physical_device)
+            .field("device", &self.device)
+            .field("queue_family_index", &self.queue_family_index)
+            .field("queue_index", &self.queue_index)
+            .field(
+                "get_instance_proc_addr",
+                &self.get_instance_proc_addr.map(|_| "<fn>"),
+            )
+            .finish()
+    }
+}
+
+impl ExternalDevice {
+    /// Convenience constructor with `queue_index = 0` and the system
+    /// loader for function resolution.
+    pub fn new(
+        instance: crate::sys::VkInstance,
+        physical_device: crate::sys::VkPhysicalDevice,
+        device: VkDevice,
+        queue_family_index: u32,
+    ) -> Self {
+        Self {
+            instance,
+            physical_device,
+            device,
+            queue_family_index,
+            queue_index: 0,
+            get_instance_proc_addr: None,
+        }
+    }
+
+    /// Builder-style override of [`ExternalDevice::queue_index`].
+    pub fn with_queue_index(mut self, queue_index: u32) -> Self {
+        self.queue_index = queue_index;
+        self
+    }
+
+    /// Builder-style override of
+    /// [`ExternalDevice::get_instance_proc_addr`] for applications
+    /// using a non-standard loader.
+    pub fn with_get_instance_proc_addr(
+        mut self,
+        get_instance_proc_addr: crate::sys::FnVkGetInstanceProcAddr,
+    ) -> Self {
+        self.get_instance_proc_addr = Some(get_instance_proc_addr);
+        self
+    }
+
+    /// Import the handles as non-owning wrapper objects:
+    /// `(Instance, VkPhysicalDevice handle)` — the second element is
+    /// re-wrapped per use via
+    /// [`crate::Instance::physical_device_from_raw`] because
+    /// `PhysicalDevice` borrows the returned `Instance`.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`crate::Instance::from_raw`] and
+    /// [`Device::from_raw`]: all three handles are valid, mutually
+    /// consistent (device from physical device from instance), stay
+    /// alive for the lifetime of the returned wrappers, and are not
+    /// destroyed / used concurrently while the wrappers are in use.
+    pub unsafe fn import(&self) -> Result<(crate::Instance, Device), VkError> {
+        // SAFETY: forwarded caller contract.
+        let instance = unsafe {
+            match self.get_instance_proc_addr {
+                Some(gipa) => crate::Instance::from_raw_with_loader(self.instance, gipa)?,
+                None => crate::Instance::from_raw(self.instance)?,
+            }
+        };
+        // SAFETY: `physical_device` belongs to `instance` per the
+        // caller contract; the returned `PhysicalDevice` only lives
+        // for this call.
+        let device = unsafe {
+            let pd = instance.physical_device_from_raw(self.physical_device);
+            Device::from_raw(&pd, self.device)?
+        };
+        Ok((instance, device))
     }
 }
