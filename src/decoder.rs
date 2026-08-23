@@ -153,30 +153,26 @@ fn compute_slice_offsets(bitstream: &[u8]) -> Vec<u32> {
     let len = bitstream.len();
 
     while pos + 4 <= len {
-        let sc_pos;
-        let sc_len;
-        if bitstream[pos] == 0
+        let sc_len = if bitstream[pos] == 0
             && bitstream[pos + 1] == 0
             && bitstream[pos + 2] == 0
             && bitstream[pos + 3] == 1
         {
-            sc_pos = pos;
-            sc_len = 4;
+            4
         } else if bitstream[pos] == 0 && bitstream[pos + 1] == 0 && bitstream[pos + 2] == 1 {
-            sc_pos = pos;
-            sc_len = 3;
+            3
         } else {
             pos += 1;
             continue;
-        }
-        let nal_byte_pos = sc_pos + sc_len;
+        };
+        let nal_byte_pos = pos + sc_len;
         if nal_byte_pos < len {
             let nt = bitstream[nal_byte_pos] & 0x1F;
             if nt == 1 || nt == 5 {
-                offsets.push(sc_pos as u32);
+                offsets.push(pos as u32);
             }
         }
-        pos = sc_pos + sc_len;
+        pos += sc_len;
     }
     offsets
 }
