@@ -1247,6 +1247,14 @@ impl StdVideoH264SpsFlags {
     pub const CONSTRAINT_SET0: u32 = 1 << 0;
     /// constraint_set1_flag (bit 1)
     pub const CONSTRAINT_SET1: u32 = 1 << 1;
+    /// constraint_set2_flag (bit 2)
+    pub const CONSTRAINT_SET2: u32 = 1 << 2;
+    /// constraint_set3_flag (bit 3)
+    pub const CONSTRAINT_SET3: u32 = 1 << 3;
+    /// constraint_set4_flag (bit 4)
+    pub const CONSTRAINT_SET4: u32 = 1 << 4;
+    /// constraint_set5_flag (bit 5)
+    pub const CONSTRAINT_SET5: u32 = 1 << 5;
     /// direct_8x8_inference_flag (bit 6)
     pub const DIRECT_8X8_INFERENCE: u32 = 1 << 6;
     /// mb_adaptive_frame_field_flag (bit 7)
@@ -1255,8 +1263,12 @@ impl StdVideoH264SpsFlags {
     pub const FRAME_MBS_ONLY: u32 = 1 << 8;
     /// delta_pic_order_always_zero_flag (bit 9)
     pub const DELTA_POC_ALWAYS_ZERO: u32 = 1 << 9;
+    /// separate_colour_plane_flag (bit 10)
+    pub const SEPARATE_COLOUR_PLANE: u32 = 1 << 10;
     /// gaps_in_frame_num_value_allowed_flag (bit 11)
     pub const GAPS_IN_FRAME_NUM: u32 = 1 << 11;
+    /// qpprime_y_zero_transform_bypass_flag (bit 12)
+    pub const QPPRIME_Y_ZERO_TRANSFORM_BYPASS: u32 = 1 << 12;
     /// frame_cropping_flag (bit 13)
     pub const FRAME_CROPPING: u32 = 1 << 13;
     /// vui_parameters_present_flag (bit 15)

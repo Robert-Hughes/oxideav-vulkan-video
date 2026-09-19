@@ -1,17 +1,17 @@
 //! Vulkan Video H.264 decoder pipeline.
 //!
-//! Round 4 implementation. The decoder is a packet-driven `oxideav_core::Decoder`
-//! impl that lazily constructs the `VkInstance` / `VkDevice` /
-//! `VkVideoSessionKHR` / `VkVideoSessionParametersKHR` / images / buffers
-//! / command pool the first time SPS+PPS are seen, then issues a
-//! single `vkCmdDecodeVideoKHR` per VCL slice and copies the decoded
-//! NV12 image back into a planar `VideoFrame`.
+//! The decoder is a packet-driven `oxideav_core::Decoder` implementation that
+//! assembles Annex-B access units, delegates H.264 picture/POC/DPB semantics to
+//! the shared `oxideav-h264` hardware frontend, lazily constructs the Vulkan
+//! video session when SPS+PPS become available, then submits one
+//! `vkCmdDecodeVideoKHR` per picture and copies the decoded NV12 image back into
+//! a planar `VideoFrame`.
 //!
 //! # Pipeline shape
 //!
-//! 1. Parse Annex-B SPS / PPS into the `StdVideoH264*` structs the GPU
-//!    consumes (delegated to the workspace-shared
-//!    [`oxideav_bitstream::h264`] parser).
+//! 1. Parse complete Annex-B pictures through `H264PictureFrontend`, producing
+//!    SPS/PPS, picture order counts, reference-picture state and stable DPB keys
+//!    shared with the other hardware backends.
 //! 2. Open a `VkInstance` (Vulkan 1.2), pick a discrete GPU that
 //!    advertises `VK_KHR_video_decode_h264`, and create a `VkDevice`
 //!    with a queue from a video-decode-capable queue family.
@@ -32,12 +32,11 @@
 //!    frame (luma + chroma plane) so we can read pixels back via
 //!    `vkCmdCopyImageToBuffer`.
 //! 9. Record + submit a single command buffer that:
-//!    a. Transitions the DPB image to `VIDEO_DECODE_DPB_KHR`.
-//!    b. Begins coding scope.
-//!    c. Issues the spec-mandated `RESET` control on first submission.
-//!    d. Issues `vkCmdDecodeVideoKHR` against the SPS/PPS-bound
-//!    `VkVideoSessionParametersKHR`, with a setup reference slot
-//!    identifying DPB slot 0 (the IDR's reconstruction).
+//!    a. Transitions the DPB image to `VIDEO_DECODE_DPB_KHR` once and preserves it.
+//!    b. Begins a coding scope with the live references plus reconstruction target bound.
+//!    c. Issues the spec-mandated `RESET` control only for a new/reset sequence.
+//!    d. Issues `vkCmdDecodeVideoKHR` with the picture's actual frame/POC metadata,
+//!    setup slot and active reference slots mapped from the shared H.264 DPB.
 //!    e. Ends coding scope.
 //!    f. Transitions the output image to `TRANSFER_SRC_OPTIMAL` and
 //!    `vkCmdCopyImageToBuffer` it to staging.
@@ -46,28 +45,26 @@
 //!
 //! # Reality check
 //!
-//! Vulkan video decode is the most fragile of the four bridges. Driver
-//! quirks abound (NVIDIA wants the bitstream pre-padded to a specific
-//! alignment, AMD wants distinct DPB / output images, Intel returns
-//! `OUT_OF_DATE_KHR` from `vkCmdDecodeVideoKHR` in some firmware
-//! versions). The pipeline above is the spec-recommended shape; if a
-//! driver-specific quirk causes the test to come back with constant
-//! pixels instead of the rendered IDR, we record that in CHANGELOG and
-//! fall through to a `Error::Unsupported` runtime registration so the
-//! framework's pure-Rust h264 path takes over.
+//! Vulkan video decode remains driver-sensitive. The backend validates the
+//! stream shape and advertised device capabilities before submission and
+//! returns `Error::Unsupported` for codec tools it cannot translate safely,
+//! allowing framework dispatch to choose another H.264 implementation rather
+//! than approximating reference state. The GPU regression tests cover both the
+//! original isolated-IDR case and a normal IDR/P/B GOP.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
 };
-
-use oxideav_bitstream::h264::{
-    self as bs_h264, H264Pps, H264Sps, NAL_TYPE_IDR, NAL_TYPE_NON_IDR_SLICE, NAL_TYPE_PPS,
-    NAL_TYPE_SPS,
-};
+use oxideav_h264::access_unit::{starts_with_annex_b, AnnexBAccessUnitAssembler};
+use oxideav_h264::dpb_output::{DpbOutput, OutputEntry};
+use oxideav_h264::picture_frontend::{H264PictureFrontend, PreparedH264Picture};
+use oxideav_h264::pps::Pps;
+use oxideav_h264::ref_list::{DpbEntry, RefMarking};
+use oxideav_h264::sps::Sps;
 
 use crate::device::{Device, ExternalDevice};
 use crate::instance::Instance;
@@ -89,10 +86,9 @@ use crate::sys::{
     VkVideoDecodeH264SessionParametersAddInfoKHR, VkVideoDecodeH264SessionParametersCreateInfoKHR,
     VkVideoDecodeInfoKHR, VkVideoEndCodingInfoKHR, VkVideoPictureResourceInfoKHR,
     VkVideoProfileInfoKHR, VkVideoProfileListInfoKHR, VkVideoReferenceSlotInfoKHR,
-    VkVideoSessionParametersCreateInfoKHR, VkVideoSessionParametersKHR,
-    STD_VIDEO_H264_CHROMA_FORMAT_IDC_420, STD_VIDEO_H264_PROFILE_IDC_HIGH,
-    VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-    VK_API_VERSION_1_2, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR,
+    VkVideoSessionParametersCreateInfoKHR, VkVideoSessionParametersKHR, VK_ACCESS_MEMORY_READ_BIT,
+    VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_API_VERSION_1_2,
+    VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR,
     VK_COMMAND_BUFFER_LEVEL_PRIMARY, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
     VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_IMAGE_ASPECT_PLANE_1_BIT,
@@ -102,9 +98,9 @@ use crate::sys::{
     VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR, VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR,
     VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_IGNORED,
-    VK_SAMPLE_COUNT_1_BIT, VK_SHARING_MODE_EXCLUSIVE, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_IGNORED, VK_SAMPLE_COUNT_1_BIT,
+    VK_SHARING_MODE_EXCLUSIVE, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
     VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
     VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -303,6 +299,16 @@ struct DecoderState {
     /// same array image for both. AMD historically reports `DISTINCT`,
     /// in which case `output_image` is its own image.
     coincide: bool,
+    /// Number of DPB layers/slots allocated for this video session.
+    dpb_slot_count: u32,
+    /// The DPB array is transitioned from UNDEFINED to DPB layout once, then
+    /// kept there for the lifetime of the session except for the current
+    /// coincide-mode layer while it is copied to staging.
+    dpb_initialized: bool,
+    /// Distinct output images likewise leave UNDEFINED only once.
+    output_initialized: bool,
+    /// Vulkan coding state must be RESET on the first decode submission.
+    needs_reset: bool,
 
     /// Bitstream buffer offset alignment from caps. Currently unused
     /// (we use the size alignment for the decode srcBufferRange) but
@@ -461,134 +467,247 @@ impl Drop for DecoderState {
 
 // ─────────────────────────── public decoder ──────────────────────────────────
 
-/// Vulkan Video H.264 decoder.
+/// Vulkan Video H.264 streaming decoder.
 ///
-/// Implements [`oxideav_core::Decoder`] by deferring heavy initialisation
-/// (instance / device / session / parameters / images / buffers) until
-/// the first SPS+PPS NAL pair is seen on `send_packet`.
+/// Parsing, POC derivation and decoded-reference-picture marking are delegated
+/// to oxideav-h264's shared hardware frontend. This backend owns the Vulkan
+/// session/resources and the mapping from opaque H.264 DPB keys to Vulkan slots.
 pub struct H264VkDecoder {
     codec_id: CodecId,
+    au_assembler: AnnexBAccessUnitAssembler,
+    frontend: H264PictureFrontend,
     state: Option<DecoderState>,
-    sps_nals: Vec<Vec<u8>>,
-    pps_nals: Vec<Vec<u8>>,
-    output_queue: VecDeque<VideoFrame>,
-    flushed: bool,
-    /// Captured at construction from
-    /// [`CodecParameters::device_index`] (`unwrap_or(0)`). Indexes
-    /// into the same filtered physical-device list that
-    /// [`crate::engine_info`] reports.
+    dpb_slots: HashMap<u32, u32>,
+    /// DPB slots that Vulkan still considers active, including stale slots
+    /// whose H.264 keys have already left the frontend DPB.
+    active_slots: HashSet<u32>,
+    output_dpb: DpbOutput<VideoFrame>,
+    ready: VecDeque<VideoFrame>,
+    eof: bool,
     device_index: u32,
-    /// Application-supplied Vulkan handles to run on instead of
-    /// creating our own instance / device. `None` for the registry
-    /// path ([`H264VkDecoder::make`]); `Some` when constructed via
-    /// [`H264VkDecoder::make_with_device`].
     external: Option<ExternalDevice>,
 }
 
 impl H264VkDecoder {
-    /// Factory used by `register()`.
-    ///
-    /// Honours [`CodecParameters::device_index`] (`unwrap_or(0)`) by
-    /// capturing the requested index here; the index is consumed when
-    /// the heavy [`DecoderState`] is lazily constructed on the first
-    /// SPS+PPS NAL pair. `device_index` is interpreted against the
-    /// **same filter** [`crate::engine_info`] applies — every physical
-    /// device whose type is `Discrete` / `Integrated` / `Virtual` GPU
-    /// or that advertises any `VK_KHR_video_*` extension. An out-of-
-    /// range index is reported via [`Error::Unsupported`] so the codec
-    /// registry can fall back to a software path.
-    pub fn make(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Decoder>> {
-        // Probe the loader so we fail fast on hosts without Vulkan
-        // (the framework registry will fall back to the pure-Rust
-        // path).
-        sys::vtable().map_err(|e| Error::unsupported(format!("vulkan-video: {e}")))?;
-        let device_index = params.device_index.unwrap_or(0);
-        Ok(Box::new(H264VkDecoder {
+    fn new(device_index: u32, external: Option<ExternalDevice>) -> Self {
+        Self {
             codec_id: CodecId::new("h264"),
+            au_assembler: AnnexBAccessUnitAssembler::default(),
+            frontend: H264PictureFrontend::new(),
             state: None,
-            sps_nals: Vec::new(),
-            pps_nals: Vec::new(),
-            output_queue: VecDeque::new(),
-            flushed: false,
+            dpb_slots: HashMap::new(),
+            active_slots: HashSet::new(),
+            output_dpb: DpbOutput::new(4, 4),
+            ready: VecDeque::new(),
+            eof: false,
             device_index,
-            external: None,
-        }))
+            external,
+        }
     }
 
-    /// Construct a decoder that runs on an **application-owned**
-    /// Vulkan device instead of creating its own instance / device
-    /// (GitHub issue #2). Use this when your program already has a
-    /// `VkInstance` / `VkDevice` (renderer, compute app, …) and you
-    /// want video decode to share it.
-    ///
-    /// The heavy pipeline objects (video session, session parameters,
-    /// DPB / output images, buffers, command pool) are still created
-    /// lazily on the first SPS+PPS pair, exactly like the registry
-    /// path — but on `external.device`, submitting to queue
-    /// `external.queue_index` of `external.queue_family_index`.
-    /// [`CodecParameters::device_index`] is ignored (the device is
-    /// yours, there is nothing to select).
-    ///
-    /// Nothing in the decoder's `Drop` destroys the imported
-    /// instance / device; only the objects the decoder created on
-    /// top of them are torn down.
+    /// Factory used by the framework registry.
+    pub fn make(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Decoder>> {
+        sys::vtable().map_err(|e| Error::unsupported(format!("vulkan-video: {e}")))?;
+        if !params.extradata.is_empty() && !starts_with_annex_b(&params.extradata) {
+            return Err(Error::unsupported(
+                "vulkan-video: H.264 streaming decoder currently supports Annex-B input only",
+            ));
+        }
+        Ok(Box::new(Self::new(params.device_index.unwrap_or(0), None)))
+    }
+
+    /// Construct a decoder that runs on an application-owned Vulkan device.
     ///
     /// # Safety
     ///
-    /// * Every handle in `external` must be valid and mutually
-    ///   consistent: `device` created from `physical_device`, itself
-    ///   enumerated from `instance`.
-    /// * The handles must outlive the returned decoder: drop the
-    ///   decoder before destroying the device / instance. (Output
-    ///   frames are host-side copies and carry no Vulkan lifetime.)
-    /// * The device must have been created with
-    ///   `VK_KHR_video_queue`, `VK_KHR_video_decode_queue`,
-    ///   `VK_KHR_video_decode_h264` and — below Vulkan 1.3 —
-    ///   `VK_KHR_synchronization2` enabled, and with at least
-    ///   `external.queue_index + 1` queues in
-    ///   `external.queue_family_index` (a family advertising
-    ///   `VK_QUEUE_VIDEO_DECODE_BIT_KHR`).
-    /// * The decoder submits to — and waits idle on — that queue;
-    ///   the queue must not be used from other threads concurrently
-    ///   with `send_packet` / the decoder's `Drop`.
-    /// * If the instance was not created through the system Vulkan
-    ///   loader, `external.get_instance_proc_addr` must be set.
+    /// Every handle in external must remain valid and mutually consistent until
+    /// the returned decoder is dropped. The selected queue must not be used
+    /// concurrently while the decoder is submitting work.
     pub unsafe fn make_with_device(
         params: &CodecParameters,
         external: ExternalDevice,
     ) -> Result<Box<dyn oxideav_core::Decoder>> {
-        let _ = params.device_index; // documented as ignored
-        Ok(Box::new(H264VkDecoder {
-            codec_id: CodecId::new("h264"),
-            state: None,
-            sps_nals: Vec::new(),
-            pps_nals: Vec::new(),
-            output_queue: VecDeque::new(),
-            flushed: false,
-            device_index: 0,
-            external: Some(external),
-        }))
+        if !params.extradata.is_empty() && !starts_with_annex_b(&params.extradata) {
+            return Err(Error::unsupported(
+                "vulkan-video: H.264 streaming decoder currently supports Annex-B input only",
+            ));
+        }
+        Ok(Box::new(Self::new(0, Some(external))))
     }
 
-    fn ensure_state(&mut self, sps: &H264Sps, pps: &H264Pps) -> Result<()> {
+    fn ensure_state(&mut self, sps: &Sps, pps: &Pps) -> Result<()> {
         if self.state.is_some() {
             return Ok(());
         }
-        let st = match &self.external {
+        let state = match &self.external {
             Some(ext) => DecoderState::create_external(sps, pps, ext)?,
             None => DecoderState::create(sps, pps, self.device_index)?,
         };
-        self.state = Some(st);
+        self.state = Some(state);
         Ok(())
     }
 
-    /// Submit one Annex-B picture (SPS+PPS+slice) to the GPU and copy
-    /// the decoded NV12 frame back into `self.output_queue`.
-    fn submit_picture(&mut self, picture_bytes: &[u8], sps: &H264Sps) -> Result<()> {
-        let state = self.state.as_mut().ok_or_else(|| {
-            Error::other("vulkan-video: ensure_state must be called before submit_picture")
-        })?;
-        state.decode_picture(picture_bytes, sps, &mut self.output_queue)
+    fn ensure_output_dpb(&mut self, sps: &Sps) {
+        let explicit_reorder = sps
+            .vui
+            .as_ref()
+            .and_then(|v| v.bitstream_restriction.as_ref())
+            .map(|br| br.max_num_reorder_frames)
+            .unwrap_or(0);
+        let explicit_buffering = sps
+            .vui
+            .as_ref()
+            .and_then(|v| v.bitstream_restriction.as_ref())
+            .map(|br| br.max_dec_frame_buffering)
+            .unwrap_or(0);
+        let reorder = sps.max_num_ref_frames.max(explicit_reorder).clamp(4, 16);
+        let buffering = sps
+            .max_num_ref_frames
+            .max(explicit_buffering)
+            .max(reorder)
+            .min(16);
+        if self.output_dpb.max_num_reorder_frames == reorder
+            && self.output_dpb.max_dec_frame_buffering == buffering
+        {
+            return;
+        }
+        self.drain_output_dpb();
+        self.output_dpb = DpbOutput::new(reorder, buffering);
+    }
+
+    fn drain_output_dpb(&mut self) {
+        let pending = self.output_dpb.flush();
+        self.ready.extend(pending.into_iter().map(|e| e.picture));
+    }
+
+    fn target_slot(&self, picture: &PreparedH264Picture) -> Result<u32> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| Error::other("vulkan-video: decoder state is not initialised"))?;
+
+        for reference in &picture.references {
+            if reference.marking != RefMarking::Unused
+                && !self.dpb_slots.contains_key(&reference.dpb_key)
+            {
+                return Err(Error::other(format!(
+                    "vulkan-video: live H.264 DPB key {} has no Vulkan slot",
+                    reference.dpb_key
+                )));
+            }
+        }
+
+        for slot in 0..state.dpb_slot_count {
+            let occupied = if picture.reference_reset {
+                false
+            } else {
+                self.dpb_slots.values().any(|&mapped| mapped == slot)
+            };
+            if !occupied {
+                return Ok(slot);
+            }
+        }
+        Err(Error::unsupported(
+            "vulkan-video: no free DPB slot is available for the current H.264 picture",
+        ))
+    }
+
+    fn decode_access_unit(&mut self, packet: &Packet) -> Result<()> {
+        if packet.data.is_empty() {
+            return Ok(());
+        }
+        if !starts_with_annex_b(&packet.data) {
+            return Err(Error::unsupported(
+                "vulkan-video: H.264 streaming decoder received non-Annex-B access unit",
+            ));
+        }
+
+        let Some(picture) = self.frontend.prepare_access_unit(&packet.data)? else {
+            return Ok(());
+        };
+        validate_picture_shape(&picture)?;
+        if !picture.synthetic_references.is_empty() {
+            return Err(Error::unsupported(
+                "vulkan-video: non-existing H.264 frame_num-gap references are not yet materialised",
+            ));
+        }
+
+        if picture.reference_reset {
+            let pending = self.output_dpb.flush();
+            if !picture.no_output_of_prior_pics {
+                self.ready.extend(pending.into_iter().map(|e| e.picture));
+            }
+        }
+
+        self.ensure_output_dpb(&picture.sps);
+        self.ensure_state(&picture.sps, &picture.pps)?;
+        let target_slot = self.target_slot(&picture)?;
+        let target_was_active = self.active_slots.contains(&target_slot);
+        let reset_session =
+            picture.reference_reset || self.state.as_ref().is_some_and(|state| state.needs_reset);
+
+        let mut frame = self
+            .state
+            .as_mut()
+            .expect("state ensured above")
+            .decode_picture(
+                &packet.data,
+                &picture,
+                target_slot,
+                target_was_active,
+                &self.dpb_slots,
+                reset_session,
+            )?;
+        frame.pts = packet.pts;
+
+        let frame_num = picture.header.frame_num;
+        let pic_order_cnt = picture.poc.pic_order_cnt;
+        let reference_reset = picture.reference_reset;
+        let is_reference = picture.is_reference();
+        let commit = self.frontend.commit(picture);
+
+        if reset_session {
+            self.active_slots.clear();
+        }
+        if reference_reset {
+            self.dpb_slots.clear();
+        }
+        for key in commit.dead_dpb_keys {
+            self.dpb_slots.remove(&key);
+        }
+        if let Some(key) = commit.current_dpb_key {
+            self.dpb_slots.insert(key, target_slot);
+        }
+        if is_reference {
+            self.active_slots.insert(target_slot);
+        } else {
+            self.active_slots.remove(&target_slot);
+        }
+
+        if commit.mmco5 {
+            let pending = self.output_dpb.reset();
+            self.ready.extend(pending.into_iter().map(|e| e.picture));
+        }
+
+        if let Some(bumped) = self.output_dpb.push(OutputEntry {
+            picture: frame,
+            pic_order_cnt,
+            frame_num,
+            needed_for_output: false,
+        }) {
+            self.ready.push_back(bumped.picture);
+        }
+        Ok(())
+    }
+
+    fn clear_stream_state(&mut self) {
+        self.au_assembler.reset();
+        self.frontend.reset();
+        self.dpb_slots.clear();
+        self.output_dpb = DpbOutput::new(4, 4);
+        self.ready.clear();
+        self.eof = false;
+        self.state = None;
     }
 }
 
@@ -600,91 +719,41 @@ impl oxideav_core::Decoder for H264VkDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.flushed = false;
-
-        let nals = bs_h264::split_annex_b(&packet.data);
-
-        // Collect the full Annex-B bitstream (including SPS/PPS) so the
-        // GPU can re-parse from raw H.264 bytes; we still extract the
-        // structured SPS / PPS for `VkVideoSessionParametersKHR` lookup.
-        let mut got_params = false;
-        for nal in &nals {
-            if nal.is_empty() {
-                continue;
-            }
-            let nt = nal[0] & 0x1F;
-            match nt {
-                NAL_TYPE_SPS => {
-                    self.sps_nals.clear();
-                    self.sps_nals.push(nal.to_vec());
-                    got_params = true;
-                }
-                NAL_TYPE_PPS => {
-                    self.pps_nals.clear();
-                    self.pps_nals.push(nal.to_vec());
-                    got_params = true;
-                }
-                _ => {}
-            }
+        if self.eof {
+            return Err(Error::invalid(
+                "vulkan-video: H.264 decoder received packet after flush",
+            ));
         }
-
-        if got_params {
-            let sps_nal = self.sps_nals.first().cloned();
-            let pps_nal = self.pps_nals.first().cloned();
-            if let (Some(s), Some(p)) = (sps_nal, pps_nal) {
-                let parsed_sps = bs_h264::parse_sps_nal(&s)
-                    .map_err(|e| Error::other(format!("vulkan-video: SPS parse failed: {e}")))?;
-                let parsed_pps = bs_h264::parse_pps_nal(&p)
-                    .map_err(|e| Error::other(format!("vulkan-video: PPS parse failed: {e}")))?;
-                self.ensure_state(&parsed_sps, &parsed_pps)?;
-            }
+        let completed = self.au_assembler.push(packet)?;
+        for access_unit in completed {
+            self.decode_access_unit(&access_unit)?;
         }
-
-        // Find the VCL slice NAL — for the IDR fixture we expect one.
-        let mut have_vcl = false;
-        for nal in &nals {
-            if nal.is_empty() {
-                continue;
-            }
-            let nt = nal[0] & 0x1F;
-            if nt == NAL_TYPE_IDR || nt == NAL_TYPE_NON_IDR_SLICE {
-                have_vcl = true;
-                break;
-            }
-        }
-
-        if !have_vcl {
-            return Ok(());
-        }
-
-        let parsed_sps = bs_h264::parse_sps_nal(
-            self.sps_nals
-                .first()
-                .ok_or_else(|| Error::other("vulkan-video: VCL slice arrived before SPS"))?,
-        )
-        .map_err(|e| Error::other(format!("vulkan-video: SPS parse failed: {e}")))?;
-
-        // The "picture bytes" we send to the GPU are the full packet's
-        // Annex-B payload (SPS + PPS + slice). NVIDIA's driver
-        // tolerates having SPS/PPS in-band; the slice NAL is what
-        // drives the decode.
-        self.submit_picture(&packet.data, &parsed_sps)?;
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.output_queue.pop_front() {
-            return Ok(Frame::Video(f));
+        if let Some(frame) = self.ready.pop_front() {
+            return Ok(Frame::Video(frame));
         }
-        Err(if self.flushed {
-            Error::Eof
-        } else {
-            Error::NeedMore
-        })
+        if self.eof && self.output_dpb.is_empty() {
+            return Err(Error::Eof);
+        }
+        Err(Error::NeedMore)
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.flushed = true;
+        if !self.eof {
+            if let Some(access_unit) = self.au_assembler.flush() {
+                self.decode_access_unit(&access_unit)?;
+            }
+            self.drain_output_dpb();
+            self.eof = true;
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.clear_stream_state();
         Ok(())
     }
 }
@@ -692,7 +761,7 @@ impl oxideav_core::Decoder for H264VkDecoder {
 // ─────────────────────────── DecoderState — heavy lifting ────────────────────
 
 impl DecoderState {
-    fn create(sps: &H264Sps, pps: &H264Pps, device_index: u32) -> Result<Self> {
+    fn create(sps: &Sps, pps: &Pps, device_index: u32) -> Result<Self> {
         // ── Instance ────────────────────────────────────────────
         let instance = Instance::new("oxideav-vulkan-video", VK_API_VERSION_1_2)
             .map_err(|e| Error::unsupported(format!("vulkan-video: {e}")))?;
@@ -818,7 +887,7 @@ impl DecoderState {
     ///
     /// The `ExternalDevice` handles were vouched for by the caller of
     /// [`H264VkDecoder::make_with_device`]; see the contract there.
-    fn create_external(sps: &H264Sps, pps: &H264Pps, ext: &ExternalDevice) -> Result<Self> {
+    fn create_external(sps: &Sps, pps: &Pps, ext: &ExternalDevice) -> Result<Self> {
         // SAFETY: handle validity / lifetime / synchronisation were
         // guaranteed by the unsafe `make_with_device` caller.
         let (instance, device) = unsafe { ext.import() }
@@ -867,8 +936,8 @@ impl DecoderState {
     /// query, video session + parameters, DPB / output images,
     /// bitstream + staging buffers, command pool.
     fn build(
-        sps: &H264Sps,
-        pps: &H264Pps,
+        sps: &Sps,
+        pps: &Pps,
         instance: Instance,
         pd_handle: sys::VkPhysicalDevice,
         qfi: u32,
@@ -886,7 +955,8 @@ impl DecoderState {
             .iter()
             .find(|p| p.handle() == pd_handle)
             .ok_or_else(|| Error::other("vulkan-video: physical device disappeared"))?;
-        let caps = query_video_decode_h264_capabilities(pd, STD_VIDEO_H264_PROFILE_IDC_HIGH)
+        let profile_idc = h264_profile_idc(sps.profile_idc)?;
+        let caps = query_video_decode_h264_capabilities(pd, profile_idc)
             .map_err(|e| Error::unsupported(format!("vulkan-video: caps: {e}")))?;
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
             eprintln!(
@@ -925,14 +995,28 @@ impl DecoderState {
             .iter()
             .find(|p| p.handle() == pd_handle)
             .ok_or_else(|| Error::other("vulkan-video: pd lookup3 failed"))?;
-        // We size the session to a generous max so all reasonable test
-        // streams fit. Round up to picture-access-granularity.
-        let max_w = sps.coded_width().max(caps.min_coded_extent.0);
-        let max_h = sps.coded_height().max(caps.min_coded_extent.1);
-        let max_w = max_w.min(caps.max_coded_extent.0).max(16);
-        let max_h = max_h.min(caps.max_coded_extent.1).max(16);
-
+        let (coded_width, coded_height) = coded_dimensions(sps);
+        if coded_width > caps.max_coded_extent.0 || coded_height > caps.max_coded_extent.1 {
+            return Err(Error::unsupported(format!(
+                "vulkan-video: H.264 coded extent {}x{} exceeds device limit {}x{}",
+                coded_width, coded_height, caps.max_coded_extent.0, caps.max_coded_extent.1
+            )));
+        }
+        if sps.max_num_ref_frames > caps.max_active_reference_pictures {
+            return Err(Error::unsupported(format!(
+                "vulkan-video: H.264 stream requires {} references but device supports {}",
+                sps.max_num_ref_frames, caps.max_active_reference_pictures
+            )));
+        }
+        let max_w = coded_width.max(caps.min_coded_extent.0).max(16);
+        let max_h = coded_height.max(caps.min_coded_extent.1).max(16);
         let dpb_slots = caps.max_dpb_slots.clamp(1, 17);
+        if dpb_slots <= sps.max_num_ref_frames {
+            return Err(Error::unsupported(format!(
+                "vulkan-video: {} DPB slots cannot hold {} references plus a decode target",
+                dpb_slots, sps.max_num_ref_frames
+            )));
+        }
         let active_refs = caps.max_active_reference_pictures.min(16);
 
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
@@ -947,7 +1031,7 @@ impl DecoderState {
             qfi,
             &caps,
             (max_w, max_h),
-            STD_VIDEO_H264_PROFILE_IDC_HIGH,
+            profile_idc,
             dpb_slots,
             active_refs,
         )
@@ -1013,7 +1097,7 @@ impl DecoderState {
         let h264_profile = VkVideoDecodeH264ProfileInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PROFILE_INFO_KHR,
             p_next: ptr::null(),
-            std_profile_idc: STD_VIDEO_H264_PROFILE_IDC_HIGH,
+            std_profile_idc: profile_idc,
             picture_layout: VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR,
         };
         let profile = VkVideoProfileInfoKHR {
@@ -1510,7 +1594,7 @@ impl DecoderState {
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
             eprintln!("vulkan-video: command pool + buffer OK");
         }
-
+        let (display_width, display_height) = display_dimensions(sps);
         Ok(Self {
             command_buffer,
             command_pool,
@@ -1538,12 +1622,16 @@ impl DecoderState {
             physical_device_handle: pd_handle,
             device,
             instance,
-            width: sps.display_width().min(max_w),
-            height: sps.display_height().min(max_h),
+            width: display_width.min(max_w),
+            height: display_height.min(max_h),
             luma_stride,
             chroma_stride: chroma_stride_texels,
             chroma_height,
             coincide,
+            dpb_slot_count: dpb_slots,
+            dpb_initialized: false,
+            output_initialized: false,
+            needs_reset: true,
             bitstream_offset_alignment: caps.min_bitstream_buffer_offset_alignment.max(1),
             bitstream_size_alignment: caps.min_bitstream_buffer_size_alignment.max(1),
         })
@@ -1552,16 +1640,30 @@ impl DecoderState {
     fn decode_picture(
         &mut self,
         bitstream: &[u8],
-        sps: &H264Sps,
-        out_queue: &mut VecDeque<VideoFrame>,
-    ) -> Result<()> {
+        picture: &PreparedH264Picture,
+        target_slot: u32,
+        target_was_active: bool,
+        slot_map: &HashMap<u32, u32>,
+        reset_session: bool,
+    ) -> Result<VideoFrame> {
+        if target_slot >= self.dpb_slot_count {
+            return Err(Error::invalid(format!(
+                "vulkan-video: target DPB slot {target_slot} exceeds {} allocated slots",
+                self.dpb_slot_count
+            )));
+        }
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
             eprintln!(
-                "vulkan-video: decode_picture (bitstream={})",
-                bitstream.len()
+                "vulkan-video: decode_picture bytes={} frame_num={} poc={} refs={} target_slot={} idr={}",
+                bitstream.len(),
+                picture.header.frame_num,
+                picture.poc.pic_order_cnt,
+                picture.references.len(),
+                target_slot,
+                picture.is_idr()
             );
         }
-        // ── Upload bitstream to host-visible buffer ────────────
+
         if (bitstream.len() as u64) > self.bitstream_size {
             return Err(Error::other(format!(
                 "vulkan-video: bitstream {} > buffer {}",
@@ -1582,113 +1684,170 @@ impl DecoderState {
             if r != VK_SUCCESS {
                 return Err(vk_err("vkMapMemory(bitstream)", r));
             }
-            if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-                eprintln!("vulkan-video: bitstream mapped at {:p}", p);
-            }
-            // Zero-fill remainder, then copy.
             std::ptr::write_bytes(p as *mut u8, 0, self.bitstream_size as usize);
             std::ptr::copy_nonoverlapping(bitstream.as_ptr(), p as *mut u8, bitstream.len());
             (self.device.fns().unmap_memory)(self.device.handle(), self.bitstream_memory);
-            if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-                eprintln!("vulkan-video: bitstream uploaded");
-            }
         }
 
-        // ── Build the various structs for the command buffer ───
-        let std_pic_info = StdVideoDecodeH264PictureInfo {
-            flags: StdVideoDecodeH264PictureInfoFlags {
-                flags: StdVideoDecodeH264PictureInfoFlags::IS_INTRA
-                    | StdVideoDecodeH264PictureInfoFlags::IDR_PIC
-                    | StdVideoDecodeH264PictureInfoFlags::IS_REFERENCE,
-            },
-            seq_parameter_set_id: sps.seq_parameter_set_id,
-            pic_parameter_set_id: 0,
-            reserved1: 0,
-            reserved2: 0,
-            frame_num: 0,
-            idr_pic_id: 0,
-            pic_order_cnt: [0, 0],
-        };
-
-        // Find each VCL slice NAL and emit a slice offset that
-        // points to the start code prefix of that NAL, relative to
-        // srcBufferOffset (= 0 in our case).
+        let (coded_width, coded_height) = coded_dimensions(&picture.sps);
+        let std_pic_info = std_picture_info(picture);
         let slice_offsets = compute_slice_offsets(bitstream);
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!(
-                "vulkan-video: {} VCL slices at offsets {:?}",
-                slice_offsets.len(),
-                slice_offsets
-            );
+        if slice_offsets.is_empty() {
+            return Err(Error::invalid(
+                "vulkan-video: H.264 access unit contains no VCL slice offsets",
+            ));
         }
-        let slice_count = slice_offsets.len() as u32;
+        if slice_offsets.len() as u32 != picture.slice_count {
+            return Err(Error::invalid(format!(
+                "vulkan-video: parser reported {} slices but Vulkan bitstream scan found {}",
+                picture.slice_count,
+                slice_offsets.len()
+            )));
+        }
         let h264_pic_info = VkVideoDecodeH264PictureInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_PICTURE_INFO_KHR,
             p_next: ptr::null(),
             p_std_picture_info: &std_pic_info,
-            slice_count,
-            p_slice_offsets: if slice_offsets.is_empty() {
-                ptr::null()
-            } else {
-                slice_offsets.as_ptr()
-            },
+            slice_count: slice_offsets.len() as u32,
+            p_slice_offsets: slice_offsets.as_ptr(),
         };
 
-        // DPB reference slot for the IDR's reconstructed picture.
-        let dpb_picture_resource = VkVideoPictureResourceInfoKHR {
+        let setup_resource = VkVideoPictureResourceInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
             p_next: ptr::null(),
             coded_offset: VkOffset2D { x: 0, y: 0 },
             coded_extent: VkExtent2D {
-                width: sps.coded_width().max(self.width),
-                height: sps.coded_height().max(self.height),
+                width: coded_width,
+                height: coded_height,
             },
-            base_array_layer: 0,
+            base_array_layer: target_slot,
             image_view_binding: self.dpb_image_view,
         };
-
-        let std_ref_info = StdVideoDecodeH264ReferenceInfo::default();
-        let h264_dpb_slot = VkVideoDecodeH264DpbSlotInfoKHR {
+        let setup_std_ref = std_current_reference_info(picture);
+        let setup_h264_slot = VkVideoDecodeH264DpbSlotInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR,
             p_next: ptr::null(),
-            p_std_reference_info: &std_ref_info,
+            p_std_reference_info: &setup_std_ref,
         };
-
-        // Setup-reference slot describing the IDR's reconstructed picture (slot 0).
         let setup_ref = VkVideoReferenceSlotInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,
-            p_next: &h264_dpb_slot as *const _ as *const c_void,
-            slot_index: 0,
-            p_picture_resource: &dpb_picture_resource,
+            p_next: &setup_h264_slot as *const _ as *const c_void,
+            slot_index: target_slot as i32,
+            p_picture_resource: &setup_resource,
         };
 
-        // For an IDR with no priors, the active reference list is
-        // empty. The setup-reference slot declared on the decode info
-        // describes the slot the IDR's reconstruction will occupy.
-        // We list that slot here too with slot_index=-1 (inactive)
-        // so the driver knows to allocate it.
-        let begin_ref = VkVideoReferenceSlotInfoKHR {
+        let mut mapped_refs: Vec<(&DpbEntry, u32)> = Vec::new();
+        for reference in &picture.references {
+            if reference.marking == RefMarking::Unused {
+                continue;
+            }
+            let slot = slot_map.get(&reference.dpb_key).copied().ok_or_else(|| {
+                Error::other(format!(
+                    "vulkan-video: live H.264 DPB key {} has no Vulkan slot",
+                    reference.dpb_key
+                ))
+            })?;
+            mapped_refs.push((reference, slot));
+        }
+
+        let std_refs: Vec<StdVideoDecodeH264ReferenceInfo> = mapped_refs
+            .iter()
+            .map(|(reference, _)| std_reference_info(reference))
+            .collect();
+        let ref_resources: Vec<VkVideoPictureResourceInfoKHR> = mapped_refs
+            .iter()
+            .map(|(_, slot)| VkVideoPictureResourceInfoKHR {
+                s_type: VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
+                p_next: ptr::null(),
+                coded_offset: VkOffset2D { x: 0, y: 0 },
+                coded_extent: VkExtent2D {
+                    width: coded_width,
+                    height: coded_height,
+                },
+                base_array_layer: *slot,
+                image_view_binding: self.dpb_image_view,
+            })
+            .collect();
+        let ref_h264_slots: Vec<VkVideoDecodeH264DpbSlotInfoKHR> = std_refs
+            .iter()
+            .map(|std_ref| VkVideoDecodeH264DpbSlotInfoKHR {
+                s_type: VK_STRUCTURE_TYPE_VIDEO_DECODE_H264_DPB_SLOT_INFO_KHR,
+                p_next: ptr::null(),
+                p_std_reference_info: std_ref,
+            })
+            .collect();
+        let ref_slots: Vec<VkVideoReferenceSlotInfoKHR> = mapped_refs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, slot))| VkVideoReferenceSlotInfoKHR {
+                s_type: VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: &ref_h264_slots[index] as *const _ as *const c_void,
+                slot_index: *slot as i32,
+                p_picture_resource: &ref_resources[index],
+            })
+            .collect();
+        let reference_slot_ptr = if ref_slots.is_empty() {
+            ptr::null()
+        } else {
+            ref_slots.as_ptr()
+        };
+
+        // vkCmdBeginVideoCodingKHR binds every resource that may be used in
+        // this coding scope. Existing references keep their current slot
+        // associations. A reconstruction target that is not active yet is
+        // bound with slotIndex=-1 so vkCmdDecodeVideoKHR can subsequently
+        // activate it through pSetupReferenceSlot. If the physical DPB layer
+        // is being recycled while Vulkan still considers its old slot active,
+        // bind that existing association first; the decode operation replaces
+        // it with the reconstructed picture.
+        let mut begin_resources: Vec<VkVideoPictureResourceInfoKHR> = mapped_refs
+            .iter()
+            .map(|(_, slot)| VkVideoPictureResourceInfoKHR {
+                s_type: VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
+                p_next: ptr::null(),
+                coded_offset: VkOffset2D { x: 0, y: 0 },
+                coded_extent: VkExtent2D {
+                    width: coded_width,
+                    height: coded_height,
+                },
+                base_array_layer: *slot,
+                image_view_binding: self.dpb_image_view,
+            })
+            .collect();
+        begin_resources.push(setup_resource);
+
+        let mut begin_slots: Vec<VkVideoReferenceSlotInfoKHR> = mapped_refs
+            .iter()
+            .enumerate()
+            .map(|(index, (_, slot))| VkVideoReferenceSlotInfoKHR {
+                s_type: VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,
+                p_next: ptr::null(),
+                slot_index: *slot as i32,
+                p_picture_resource: &begin_resources[index],
+            })
+            .collect();
+        let target_resource_index = begin_resources.len() - 1;
+        begin_slots.push(VkVideoReferenceSlotInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_REFERENCE_SLOT_INFO_KHR,
             p_next: ptr::null(),
-            slot_index: -1,
-            p_picture_resource: &dpb_picture_resource,
-        };
+            slot_index: if target_was_active {
+                target_slot as i32
+            } else {
+                -1
+            },
+            p_picture_resource: &begin_resources[target_resource_index],
+        });
 
-        // dst_picture_resource — where the GPU writes the decoded
-        // output. On coincide drivers this is the same view+layer as
-        // the setup reference (`output_image_view` aliases the DPB
-        // image); on distinct, it's the separate output image. Either
-        // way `output_image_view` was constructed to point at the
-        // correct backing image, so the descriptor is identical.
+        let output_layer = if self.coincide { target_slot } else { 0 };
         let dst_picture_resource = VkVideoPictureResourceInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_PICTURE_RESOURCE_INFO_KHR,
             p_next: ptr::null(),
             coded_offset: VkOffset2D { x: 0, y: 0 },
             coded_extent: VkExtent2D {
-                width: sps.coded_width().max(self.width),
-                height: sps.coded_height().max(self.height),
+                width: coded_width,
+                height: coded_height,
             },
-            base_array_layer: 0,
+            base_array_layer: output_layer,
             image_view_binding: self.output_image_view,
         };
 
@@ -1697,23 +1856,20 @@ impl DecoderState {
             .as_ref()
             .ok_or_else(|| Error::other("vulkan-video: no session"))?
             .handle();
-
         let begin_info = VkVideoBeginCodingInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_BEGIN_CODING_INFO_KHR,
             p_next: ptr::null(),
             flags: 0,
             video_session: session_handle,
             video_session_parameters: self.session_params,
-            reference_slot_count: 1,
-            p_reference_slots: &begin_ref,
+            reference_slot_count: begin_slots.len() as u32,
+            p_reference_slots: begin_slots.as_ptr(),
         };
-
         let control_info = VkVideoCodingControlInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_CODING_CONTROL_INFO_KHR,
             p_next: ptr::null(),
             flags: VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR,
         };
-
         let decode_info = VkVideoDecodeInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_DECODE_INFO_KHR,
             p_next: &h264_pic_info as *const _ as *const c_void,
@@ -1723,17 +1879,15 @@ impl DecoderState {
             src_buffer_range: align_up(bitstream.len() as u64, self.bitstream_size_alignment),
             dst_picture_resource,
             p_setup_reference_slot: &setup_ref,
-            reference_slot_count: 0,
-            p_reference_slots: ptr::null(),
+            reference_slot_count: ref_slots.len() as u32,
+            p_reference_slots: reference_slot_ptr,
         };
-
         let end_info = VkVideoEndCodingInfoKHR {
             s_type: VK_STRUCTURE_TYPE_VIDEO_END_CODING_INFO_KHR,
             p_next: ptr::null(),
             flags: 0,
         };
 
-        // ── Record command buffer ──────────────────────────────
         let cb_begin = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             p_next: ptr::null(),
@@ -1744,45 +1898,30 @@ impl DecoderState {
         if r != VK_SUCCESS {
             return Err(vk_err("vkBeginCommandBuffer", r));
         }
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!("vulkan-video: command buffer recording started");
-        }
 
-        // Transition DPB image (and output image, if distinct) from
-        // UNDEFINED to the layout the decode pass expects.
-        //
-        // Setup-reference slots — which our IDR uses to populate DPB
-        // slot 0 — require the picture-resource subresource to be in
-        // `VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR` at decode time, even
-        // when the same image subresource also serves as the decode
-        // destination (coincide mode). NVIDIA's driver SIGSEGVs when
-        // we transition into DST_KHR instead because it dereferences
-        // through what it thinks is a DPB slot pointer that the layout
-        // tracker said was an output target — exactly the
-        // VUID-vkCmdDecodeVideoKHR-pDecodeInfo-07254/07253 violation
-        // we now flag at validation time. Always go to DPB_KHR; with
-        // coincide=true the same subresource doubles as the dst.
-        let mut barriers: Vec<VkImageMemoryBarrier> = Vec::new();
-        barriers.push(VkImageMemoryBarrier {
-            s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            p_next: ptr::null(),
-            src_access_mask: 0,
-            dst_access_mask: VK_ACCESS_MEMORY_WRITE_BIT,
-            old_layout: VK_IMAGE_LAYOUT_UNDEFINED,
-            new_layout: VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR,
-            src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
-            image: self.dpb_image,
-            subresource_range: VkImageSubresourceRange {
-                aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-        });
-        if !self.coincide {
-            barriers.push(VkImageMemoryBarrier {
+        let mut initial_barriers = Vec::new();
+        if !self.dpb_initialized {
+            initial_barriers.push(VkImageMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: 0,
+                dst_access_mask: VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                old_layout: VK_IMAGE_LAYOUT_UNDEFINED,
+                new_layout: VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR,
+                src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                image: self.dpb_image,
+                subresource_range: VkImageSubresourceRange {
+                    aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: self.dpb_slot_count,
+                },
+            });
+        }
+        if !self.coincide && !self.output_initialized {
+            initial_barriers.push(VkImageMemoryBarrier {
                 s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 p_next: ptr::null(),
                 src_access_mask: 0,
@@ -1801,68 +1940,49 @@ impl DecoderState {
                 },
             });
         }
-        unsafe {
-            (self.device.fns().cmd_pipeline_barrier)(
-                self.command_buffer,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0,
-                0,
-                ptr::null(),
-                0,
-                ptr::null(),
-                barriers.len() as u32,
-                barriers.as_ptr(),
-            );
+        if !initial_barriers.is_empty() {
+            unsafe {
+                (self.device.fns().cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    initial_barriers.len() as u32,
+                    initial_barriers.as_ptr(),
+                );
+            }
         }
 
-        // Begin video coding scope.
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!(
-                "vulkan-video: recording video coding commands (skip_decode={})",
-                std::env::var("OXIDEAV_VK_SKIP_DECODE").is_ok()
-            );
-        }
         let skip_decode = std::env::var("OXIDEAV_VK_SKIP_DECODE").is_ok();
         unsafe {
             (self.device.fns().cmd_begin_video_coding_khr)(self.command_buffer, &begin_info);
-            if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-                eprintln!("vulkan-video: cmd_begin_video_coding done");
-            }
-            (self.device.fns().cmd_control_video_coding_khr)(self.command_buffer, &control_info);
-            if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-                eprintln!("vulkan-video: cmd_control done");
+            if reset_session {
+                (self.device.fns().cmd_control_video_coding_khr)(
+                    self.command_buffer,
+                    &control_info,
+                );
             }
             if !skip_decode {
                 (self.device.fns().cmd_decode_video_khr)(self.command_buffer, &decode_info);
-                if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-                    eprintln!("vulkan-video: cmd_decode done");
-                }
             }
             (self.device.fns().cmd_end_video_coding_khr)(self.command_buffer, &end_info);
-            if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-                eprintln!("vulkan-video: cmd_end done");
-            }
         }
 
-        // Transition output image to TRANSFER_SRC_OPTIMAL. After the
-        // decode submission the image's layout depends on coincide
-        // mode: with coincide=true we left the image in DPB_KHR (the
-        // setup-reference slot's required layout, which happens to
-        // also be the layout the decode wrote into); with
-        // coincide=false the dst image was distinct and transitioned
-        // to DST_KHR explicitly above.
-        let src_layout = if self.coincide {
+        let source_layout = if self.coincide {
             VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR
         } else {
             VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR
         };
-        let to_xfer = VkImageMemoryBarrier {
+        let to_transfer = VkImageMemoryBarrier {
             s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             p_next: ptr::null(),
             src_access_mask: VK_ACCESS_MEMORY_WRITE_BIT,
             dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
-            old_layout: src_layout,
+            old_layout: source_layout,
             new_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
@@ -1871,7 +1991,7 @@ impl DecoderState {
                 aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer: output_layer,
                 layer_count: 1,
             },
         };
@@ -1886,13 +2006,11 @@ impl DecoderState {
                 0,
                 ptr::null(),
                 1,
-                &to_xfer,
+                &to_transfer,
             );
         }
 
-        // Copy luma + chroma planes out via two regions.
         let luma_bytes = (self.luma_stride as u64) * (self.height as u64);
-        let _luma_bytes_aligned = align_up(luma_bytes, 16);
         let regions = [
             VkBufferImageCopy {
                 buffer_offset: 0,
@@ -1901,7 +2019,7 @@ impl DecoderState {
                 image_subresource: VkImageSubresourceLayers {
                     aspect_mask: VK_IMAGE_ASPECT_PLANE_0_BIT,
                     mip_level: 0,
-                    base_array_layer: 0,
+                    base_array_layer: output_layer,
                     layer_count: 1,
                 },
                 image_offset: VkOffset3D::default(),
@@ -1918,7 +2036,7 @@ impl DecoderState {
                 image_subresource: VkImageSubresourceLayers {
                     aspect_mask: VK_IMAGE_ASPECT_PLANE_1_BIT,
                     mip_level: 0,
-                    base_array_layer: 0,
+                    base_array_layer: output_layer,
                     layer_count: 1,
                 },
                 image_offset: VkOffset3D::default(),
@@ -1940,13 +2058,7 @@ impl DecoderState {
             );
         }
 
-        // Transition output back to a quiescent state for the next
-        // decode. The same coincide rule as the pre-decode barrier:
-        // when DPB and dst alias each other we leave the image in
-        // DPB_KHR so the next decode can re-use the slot without
-        // another transition; when distinct, DST_KHR (which is what
-        // the next decode's pre-barrier expects).
-        let next_layout = if self.coincide {
+        let quiescent_layout = if self.coincide {
             VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR
         } else {
             VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR
@@ -1955,9 +2067,9 @@ impl DecoderState {
             s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             p_next: ptr::null(),
             src_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
-            dst_access_mask: VK_ACCESS_MEMORY_READ_BIT,
+            dst_access_mask: VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             old_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            new_layout: next_layout,
+            new_layout: quiescent_layout,
             src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
             image: self.output_image,
@@ -1965,7 +2077,7 @@ impl DecoderState {
                 aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
                 base_mip_level: 0,
                 level_count: 1,
-                base_array_layer: 0,
+                base_array_layer: output_layer,
                 layer_count: 1,
             },
         };
@@ -1973,7 +2085,7 @@ impl DecoderState {
             (self.device.fns().cmd_pipeline_barrier)(
                 self.command_buffer,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_HOST_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                 0,
                 0,
                 ptr::null(),
@@ -1988,15 +2100,10 @@ impl DecoderState {
         if r != VK_SUCCESS {
             return Err(vk_err("vkEndCommandBuffer", r));
         }
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!("vulkan-video: end_command_buffer OK, submitting");
-        }
-
         if std::env::var("OXIDEAV_VK_SKIP_SUBMIT").is_ok() {
             return Err(Error::other("OXIDEAV_VK_SKIP_SUBMIT set; skipping submit"));
         }
 
-        // ── Submit ─────────────────────────────────────────────
         let queue = self
             .device
             .queue_indexed(self.queue_family_index, self.queue_index);
@@ -2021,11 +2128,12 @@ impl DecoderState {
         if r != VK_SUCCESS {
             return Err(vk_err("vkQueueWaitIdle", r));
         }
-        if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
-            eprintln!("vulkan-video: GPU done, reading staging");
+        self.dpb_initialized = true;
+        if !self.coincide {
+            self.output_initialized = true;
         }
+        self.needs_reset = false;
 
-        // ── Read pixels back from staging ───────────────────────
         let mut frame_y = vec![0u8; (self.width as usize) * (self.height as usize)];
         let cw = self.width.div_ceil(2) as usize;
         let ch = self.chroma_height as usize;
@@ -2046,31 +2154,25 @@ impl DecoderState {
                 return Err(vk_err("vkMapMemory(staging)", r));
             }
             let host = p as *const u8;
-            // Copy luma row-by-row (stride = luma_stride, dst stride = width).
             let lstride = self.luma_stride as usize;
             for y in 0..self.height as usize {
                 let src = host.add(y * lstride);
                 let dst = frame_y.as_mut_ptr().add(y * self.width as usize);
                 std::ptr::copy_nonoverlapping(src, dst, self.width as usize);
             }
-            // De-interleave NV12 chroma: UV-pair-per-2x2-luma-block.
-            // `chroma_stride` is in texels of plane 1 (R8G8); each
-            // texel is 2 bytes, so the byte stride is `2*cstride`.
             let chroma_off = (self.luma_stride as usize) * (self.height as usize);
             let cstride_bytes = (self.chroma_stride as usize) * 2;
             for y in 0..ch {
                 for x in 0..cw {
                     let src_pair = host.add(chroma_off + y * cstride_bytes + x * 2);
-                    let u = *src_pair;
-                    let v = *src_pair.add(1);
-                    frame_u[y * cw + x] = u;
-                    frame_v[y * cw + x] = v;
+                    frame_u[y * cw + x] = *src_pair;
+                    frame_v[y * cw + x] = *src_pair.add(1);
                 }
             }
             (self.device.fns().unmap_memory)(self.device.handle(), self.staging_memory);
         }
 
-        out_queue.push_back(VideoFrame {
+        Ok(VideoFrame {
             pts: None,
             planes: vec![
                 VideoPlane {
@@ -2086,20 +2188,192 @@ impl DecoderState {
                     data: frame_v,
                 },
             ],
-        });
-        Ok(())
+        })
     }
 }
 
-// ─────────────────────── H264Sps/H264Pps → Std structs ──────────────────────
+fn validate_picture_shape(picture: &PreparedH264Picture) -> Result<()> {
+    let sps = &picture.sps;
+    let pps = &picture.pps;
+    let header = &picture.header;
+    if header.field_pic_flag || sps.mb_adaptive_frame_field_flag {
+        return Err(Error::unsupported(
+            "vulkan-video: H.264 streaming decoder currently supports progressive frame pictures only",
+        ));
+    }
+    if sps.chroma_format_idc != 1
+        || sps.separate_colour_plane_flag
+        || sps.bit_depth_luma_minus8 != 0
+        || sps.bit_depth_chroma_minus8 != 0
+    {
+        return Err(Error::unsupported(
+            "vulkan-video: H.264 streaming decoder currently supports 8-bit 4:2:0 only",
+        ));
+    }
+    if !matches!(sps.profile_idc, 66 | 77 | 100) {
+        return Err(Error::unsupported(format!(
+            "vulkan-video: unsupported H.264 profile_idc={}",
+            sps.profile_idc
+        )));
+    }
+    if sps.seq_scaling_matrix_present_flag
+        || pps
+            .extension
+            .as_ref()
+            .is_some_and(|e| e.pic_scaling_matrix_present_flag)
+    {
+        return Err(Error::unsupported(
+            "vulkan-video: custom H.264 scaling matrices are not translated yet",
+        ));
+    }
+    if pps.num_slice_groups_minus1 != 0 {
+        return Err(Error::unsupported(
+            "vulkan-video: H.264 flexible macroblock ordering is not supported yet",
+        ));
+    }
+    if sps
+        .frame_cropping
+        .as_ref()
+        .is_some_and(|crop| crop.left != 0 || crop.top != 0)
+    {
+        return Err(Error::unsupported(
+            "vulkan-video: non-zero left/top H.264 frame cropping is not supported yet",
+        ));
+    }
+    Ok(())
+}
 
-fn std_sps_from_parsed(s: &H264Sps) -> StdVideoH264SequenceParameterSet {
+fn coded_dimensions(sps: &Sps) -> (u32, u32) {
+    (sps.pic_width_in_mbs() * 16, sps.frame_height_in_mbs() * 16)
+}
+
+fn display_dimensions(sps: &Sps) -> (u32, u32) {
+    let (coded_width, coded_height) = coded_dimensions(sps);
+    let Some(crop) = &sps.frame_cropping else {
+        return (coded_width, coded_height);
+    };
+    // This backend currently accepts only progressive 4:2:0, for which
+    // CropUnitX=2 and CropUnitY=2.
+    (
+        coded_width.saturating_sub(2 * (crop.left + crop.right)),
+        coded_height.saturating_sub(2 * (crop.top + crop.bottom)),
+    )
+}
+
+fn h264_profile_idc(profile_idc: u8) -> Result<sys::StdVideoH264ProfileIdc> {
+    match profile_idc {
+        66 => Ok(sys::STD_VIDEO_H264_PROFILE_IDC_BASELINE),
+        77 => Ok(sys::STD_VIDEO_H264_PROFILE_IDC_MAIN),
+        100 => Ok(sys::STD_VIDEO_H264_PROFILE_IDC_HIGH),
+        other => Err(Error::unsupported(format!(
+            "vulkan-video: unsupported H.264 profile_idc={other}"
+        ))),
+    }
+}
+
+fn std_picture_info(picture: &PreparedH264Picture) -> StdVideoDecodeH264PictureInfo {
+    let mut flags = 0;
+    if picture.header.field_pic_flag {
+        flags |= StdVideoDecodeH264PictureInfoFlags::FIELD_PIC;
+    }
+    if picture.header.slice_type.is_intra() {
+        flags |= StdVideoDecodeH264PictureInfoFlags::IS_INTRA;
+    }
+    if picture.is_idr() {
+        flags |= StdVideoDecodeH264PictureInfoFlags::IDR_PIC;
+    }
+    if picture.header.bottom_field_flag {
+        flags |= StdVideoDecodeH264PictureInfoFlags::BOTTOM_FIELD;
+    }
+    if picture.is_reference() {
+        flags |= StdVideoDecodeH264PictureInfoFlags::IS_REFERENCE;
+    }
+    StdVideoDecodeH264PictureInfo {
+        flags: StdVideoDecodeH264PictureInfoFlags { flags },
+        seq_parameter_set_id: picture.sps.seq_parameter_set_id as u8,
+        pic_parameter_set_id: picture.pps.pic_parameter_set_id as u8,
+        reserved1: 0,
+        reserved2: 0,
+        frame_num: picture.header.frame_num as u16,
+        idr_pic_id: picture.header.idr_pic_id as u16,
+        pic_order_cnt: [
+            picture.poc.top_field_order_cnt,
+            picture.poc.bottom_field_order_cnt,
+        ],
+    }
+}
+
+fn std_reference_info(entry: &DpbEntry) -> StdVideoDecodeH264ReferenceInfo {
+    let long_term = entry.marking == RefMarking::LongTerm;
+    let mut flags = 0;
+    if long_term {
+        flags |= sys::StdVideoDecodeH264ReferenceInfoFlags::USED_FOR_LONG_TERM_REFERENCE;
+    }
+    StdVideoDecodeH264ReferenceInfo {
+        flags: sys::StdVideoDecodeH264ReferenceInfoFlags { flags },
+        frame_num: if long_term {
+            entry.long_term_frame_idx as u16
+        } else {
+            entry.frame_num as u16
+        },
+        reserved: 0,
+        pic_order_cnt: [entry.top_field_order_cnt, entry.bottom_field_order_cnt],
+    }
+}
+
+fn current_long_term_index(picture: &PreparedH264Picture) -> Option<u32> {
+    let marking = picture.header.dec_ref_pic_marking.as_ref()?;
+    if picture.is_idr() {
+        return marking.long_term_reference_flag.then_some(0);
+    }
+    marking
+        .adaptive_marking
+        .as_ref()?
+        .iter()
+        .find_map(|op| match op {
+            oxideav_h264::slice_header::MmcoOp::AssignCurrentLongTerm(index) => Some(*index),
+            _ => None,
+        })
+}
+
+fn std_current_reference_info(picture: &PreparedH264Picture) -> StdVideoDecodeH264ReferenceInfo {
+    let long_term_index = current_long_term_index(picture);
+    let mut flags = 0;
+    if long_term_index.is_some() {
+        flags |= sys::StdVideoDecodeH264ReferenceInfoFlags::USED_FOR_LONG_TERM_REFERENCE;
+    }
+    StdVideoDecodeH264ReferenceInfo {
+        flags: sys::StdVideoDecodeH264ReferenceInfoFlags { flags },
+        frame_num: long_term_index.unwrap_or(picture.header.frame_num) as u16,
+        reserved: 0,
+        pic_order_cnt: [
+            picture.poc.top_field_order_cnt,
+            picture.poc.bottom_field_order_cnt,
+        ],
+    }
+}
+
+// ─────────────────────── Sps/Pps → Std structs ──────────────────────
+
+fn std_sps_from_parsed(s: &Sps) -> StdVideoH264SequenceParameterSet {
     let mut flags: u32 = 0;
-    if s.constraint_set_flags & 0x80 != 0 {
+    if s.constraint_set_flags & (1 << 0) != 0 {
         flags |= StdVideoH264SpsFlags::CONSTRAINT_SET0;
     }
-    if s.constraint_set_flags & 0x40 != 0 {
+    if s.constraint_set_flags & (1 << 1) != 0 {
         flags |= StdVideoH264SpsFlags::CONSTRAINT_SET1;
+    }
+    if s.constraint_set_flags & (1 << 2) != 0 {
+        flags |= StdVideoH264SpsFlags::CONSTRAINT_SET2;
+    }
+    if s.constraint_set_flags & (1 << 3) != 0 {
+        flags |= StdVideoH264SpsFlags::CONSTRAINT_SET3;
+    }
+    if s.constraint_set_flags & (1 << 4) != 0 {
+        flags |= StdVideoH264SpsFlags::CONSTRAINT_SET4;
+    }
+    if s.constraint_set_flags & (1 << 5) != 0 {
+        flags |= StdVideoH264SpsFlags::CONSTRAINT_SET5;
     }
     if s.direct_8x8_inference_flag {
         flags |= StdVideoH264SpsFlags::DIRECT_8X8_INFERENCE;
@@ -2110,48 +2384,67 @@ fn std_sps_from_parsed(s: &H264Sps) -> StdVideoH264SequenceParameterSet {
     if s.frame_mbs_only_flag {
         flags |= StdVideoH264SpsFlags::FRAME_MBS_ONLY;
     }
+    if s.delta_pic_order_always_zero_flag {
+        flags |= StdVideoH264SpsFlags::DELTA_POC_ALWAYS_ZERO;
+    }
+    if s.separate_colour_plane_flag {
+        flags |= StdVideoH264SpsFlags::SEPARATE_COLOUR_PLANE;
+    }
     if s.gaps_in_frame_num_value_allowed_flag {
         flags |= StdVideoH264SpsFlags::GAPS_IN_FRAME_NUM;
     }
-    let crop = s.frame_cropping.unwrap_or_default();
+    if s.qpprime_y_zero_transform_bypass_flag {
+        flags |= StdVideoH264SpsFlags::QPPRIME_Y_ZERO_TRANSFORM_BYPASS;
+    }
     if s.frame_cropping.is_some() {
         flags |= StdVideoH264SpsFlags::FRAME_CROPPING;
     }
-    // VUI is not parsed by oxideav-bitstream, so we never set the
-    // VUI_PARAMETERS_PRESENT flag and leave `p_sequence_parameter_set_vui`
-    // null. The IDR-only fixture works fine without it.
+
+    let (crop_left, crop_right, crop_top, crop_bottom) = s
+        .frame_cropping
+        .as_ref()
+        .map(|crop| (crop.left, crop.right, crop.top, crop.bottom))
+        .unwrap_or((0, 0, 0, 0));
+    let offset_ptr = if s.offset_for_ref_frame.is_empty() {
+        ptr::null()
+    } else {
+        s.offset_for_ref_frame.as_ptr()
+    };
+
     StdVideoH264SequenceParameterSet {
         flags: StdVideoH264SpsFlags { flags },
         profile_idc: s.profile_idc as i32,
         level_idc: h264_level_byte_to_idc(s.level_idc),
-        chroma_format_idc: STD_VIDEO_H264_CHROMA_FORMAT_IDC_420,
-        seq_parameter_set_id: s.seq_parameter_set_id,
-        bit_depth_luma_minus8: s.bit_depth_luma_minus8,
-        bit_depth_chroma_minus8: s.bit_depth_chroma_minus8,
-        log2_max_frame_num_minus4: s.log2_max_frame_num_minus4,
+        chroma_format_idc: s.chroma_format_idc as i32,
+        seq_parameter_set_id: s.seq_parameter_set_id as u8,
+        bit_depth_luma_minus8: s.bit_depth_luma_minus8 as u8,
+        bit_depth_chroma_minus8: s.bit_depth_chroma_minus8 as u8,
+        log2_max_frame_num_minus4: s.log2_max_frame_num_minus4 as u8,
         pic_order_cnt_type: s.pic_order_cnt_type as i32,
-        offset_for_non_ref_pic: 0,
-        offset_for_top_to_bottom_field: 0,
-        log2_max_pic_order_cnt_lsb_minus4: s.log2_max_pic_order_cnt_lsb_minus4,
-        num_ref_frames_in_pic_order_cnt_cycle: 0,
+        offset_for_non_ref_pic: s.offset_for_non_ref_pic,
+        offset_for_top_to_bottom_field: s.offset_for_top_to_bottom_field,
+        log2_max_pic_order_cnt_lsb_minus4: s.log2_max_pic_order_cnt_lsb_minus4 as u8,
+        num_ref_frames_in_pic_order_cnt_cycle: s.num_ref_frames_in_pic_order_cnt_cycle as u8,
         max_num_ref_frames: s.max_num_ref_frames as u8,
         reserved1: 0,
         pic_width_in_mbs_minus1: s.pic_width_in_mbs_minus1,
         pic_height_in_map_units_minus1: s.pic_height_in_map_units_minus1,
-        frame_crop_left_offset: crop.left,
-        frame_crop_right_offset: crop.right,
-        frame_crop_top_offset: crop.top,
-        frame_crop_bottom_offset: crop.bottom,
+        frame_crop_left_offset: crop_left,
+        frame_crop_right_offset: crop_right,
+        frame_crop_top_offset: crop_top,
+        frame_crop_bottom_offset: crop_bottom,
         reserved2: 0,
-        p_offset_for_ref_frame: ptr::null(),
+        p_offset_for_ref_frame: offset_ptr,
         p_scaling_lists: ptr::null(),
+        // VUI is not consumed by H.264 picture reconstruction; omit it until
+        // the Vulkan std-video VUI structs are modelled by this crate.
         p_sequence_parameter_set_vui: ptr::null(),
     }
 }
 
-fn std_pps_from_parsed(p: &H264Pps) -> StdVideoH264PictureParameterSet {
+fn std_pps_from_parsed(p: &Pps) -> StdVideoH264PictureParameterSet {
     let mut flags: u32 = 0;
-    if p.transform_8x8_mode_flag {
+    if p.transform_8x8_mode_flag() {
         flags |= StdVideoH264PpsFlags::TRANSFORM_8X8_MODE;
     }
     if p.redundant_pic_cnt_present_flag {
@@ -2172,20 +2465,17 @@ fn std_pps_from_parsed(p: &H264Pps) -> StdVideoH264PictureParameterSet {
     if p.entropy_coding_mode_flag {
         flags |= StdVideoH264PpsFlags::ENTROPY_CODING_MODE;
     }
-    // pic_scaling_matrix_present_flag — oxideav-bitstream rejects PPS
-    // with scaling-matrix-present (Unsupported) so by construction this
-    // flag is always 0 for any parsed PPS we get here.
     StdVideoH264PictureParameterSet {
         flags: StdVideoH264PpsFlags { flags },
-        seq_parameter_set_id: p.seq_parameter_set_id,
-        pic_parameter_set_id: p.pic_parameter_set_id,
-        num_ref_idx_l0_default_active_minus1: p.num_ref_idx_l0_default_active_minus1,
-        num_ref_idx_l1_default_active_minus1: p.num_ref_idx_l1_default_active_minus1,
+        seq_parameter_set_id: p.seq_parameter_set_id as u8,
+        pic_parameter_set_id: p.pic_parameter_set_id as u8,
+        num_ref_idx_l0_default_active_minus1: p.num_ref_idx_l0_default_active_minus1 as u8,
+        num_ref_idx_l1_default_active_minus1: p.num_ref_idx_l1_default_active_minus1 as u8,
         weighted_bipred_idc: p.weighted_bipred_idc as i32,
         pic_init_qp_minus26: p.pic_init_qp_minus26 as i8,
         pic_init_qs_minus26: p.pic_init_qs_minus26 as i8,
         chroma_qp_index_offset: p.chroma_qp_index_offset as i8,
-        second_chroma_qp_index_offset: p.second_chroma_qp_index_offset as i8,
+        second_chroma_qp_index_offset: p.second_chroma_qp_index_offset() as i8,
         p_scaling_lists: ptr::null(),
     }
 }

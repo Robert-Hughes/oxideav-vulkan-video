@@ -25,17 +25,26 @@ oxideav-core = { version = "0.1", optional = true }
 # to an empty rlib elsewhere.
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 libloading = "0.8"
-# Shared H.264 / HEVC / AV1 minimal parser used to extract SPS / PPS /
-# slice-header fields before populating `StdVideoH264*` structs for the
-# Vulkan video session parameters. The bitstream crate has no target
-# gate of its own (pure Rust, no FFI), so adding it under the
-# linux/windows gate lines up with the rest of the crate body.
+# Shared minimal bitstream parser retained for the non-H.264 bridges and
+# compatibility helpers.
 oxideav-bitstream = { version = "0.0" }
+# Full shared H.264 parser/POC/DPB frontend used by the streaming decoder.
+# Keep this optional with the framework-facing registry feature, matching
+# oxideav-vdpau's hardware-backend integration.
+oxideav-h264 = { version = "0.1", optional = true }
 # Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
 # via the `oxideav_core::register!` macro. Same target gate as the
 # rest of the crate body. Optional + gated behind `registry` so
 # default-features=false consumers don't pull it in.
 linkme = { version = "0.3", optional = true }
+
+# The streaming hardware frontend used below is newer than the crates.io
+# releases at the time of this fork. Keep the public dev branch independently
+# buildable; consumers such as SanctuaryPlayer may override these with their
+# own workspace/local patches.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/Robert-Hughes/oxideav-core.git", branch = "dev" }
+oxideav-h264 = { git = "https://github.com/Robert-Hughes/oxideav-h264.git", branch = "dev" }
 
 [features]
 default = ["registry"]
@@ -44,7 +53,7 @@ default = ["registry"]
 # `oxideav-core` so the crate can plug into the `oxideav` framework
 # registry. Default-on; turn off for tooling that just wants the raw
 # Vulkan Video bridge bindings without the framework.
-registry = ["dep:oxideav-core", "dep:linkme"]
+registry = ["dep:oxideav-core", "dep:linkme", "dep:oxideav-h264"]
 
 # Helper binary used by the Round 4 integration test to attempt the
 # full H.264 decode pipeline in a fork-isolated subprocess (so a

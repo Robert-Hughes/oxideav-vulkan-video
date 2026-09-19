@@ -9,7 +9,7 @@
 //!
 //! Behaviour:
 //!   * Reads `OXIDEAV_VK_FIXTURE` (path to an Annex-B .h264 file).
-//!   * Decodes the first packet as a single-frame IDR.
+//!   * Decodes every access unit in the supplied Annex-B stream.
 //!   * On success, writes a planar I420 dump to
 //!     `OXIDEAV_VK_DECODE_OUTPUT` and exits 0.
 //!   * On any non-driver failure exits with code 2 and prints the
@@ -80,29 +80,50 @@ fn main() -> ExitCode {
         eprintln!("helper: send_packet returned {e}");
         return ExitCode::from(2);
     }
-
-    let frame = match dec.receive_frame() {
-        Ok(Frame::Video(f)) => f,
-        Ok(_) => {
-            eprintln!("helper: received non-video frame");
-            return ExitCode::from(2);
-        }
-        Err(e) => {
-            eprintln!("helper: receive_frame returned {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    // Serialise as I420 (Y + U + V).
+    if let Err(e) = dec.flush() {
+        eprintln!("helper: flush returned {e}");
+        return ExitCode::from(2);
+    }
+    // Drain every decoded picture and serialise it as consecutive I420
+    // frames (Y + U + V). This makes the helper useful for normal GOPs,
+    // not merely the original single-IDR smoke test.
     let mut buf = Vec::new();
-    for plane in &frame.planes {
-        buf.extend_from_slice(&plane.data);
+    let mut frame_count = 0usize;
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(frame)) => {
+                for plane in &frame.planes {
+                    buf.extend_from_slice(&plane.data);
+                }
+                frame_count += 1;
+            }
+            Ok(_) => {
+                eprintln!("helper: received non-video frame");
+                return ExitCode::from(2);
+            }
+            Err(oxideav_core::Error::Eof) => break,
+            Err(oxideav_core::Error::NeedMore) => {
+                eprintln!("helper: decoder requested more data after flush");
+                return ExitCode::from(2);
+            }
+            Err(e) => {
+                eprintln!("helper: receive_frame returned {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if frame_count == 0 {
+        eprintln!("helper: decoder produced no video frames");
+        return ExitCode::from(2);
     }
     if let Err(e) = std::fs::write(&output, &buf) {
         eprintln!("helper: write {output:?}: {e}");
         return ExitCode::from(2);
     }
 
-    eprintln!("helper: wrote {} bytes to {output:?}", buf.len());
+    eprintln!(
+        "helper: wrote {frame_count} frame(s), {} bytes to {output:?}",
+        buf.len()
+    );
     ExitCode::SUCCESS
 }

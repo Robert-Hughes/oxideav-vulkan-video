@@ -111,7 +111,7 @@ unregistering them.
 
 | Codec | Decode | Encode |
 |-------|--------|--------|
-| H.264 | Full pipeline wired end-to-end (session + parameters, DPB NV12 image, bitstream/staging buffers, command recording, NV12 readback); validation-clean | planned |
+| H.264 | Streaming Annex-B Baseline/Main/High 8-bit 4:2:0 progressive decode: I/P/B pictures, shared H.264 POC/DPB frontend, Vulkan reference-slot mapping, NV12 readback; unsupported stream tools fail explicitly | planned |
 | HEVC  | Capability query wired; session/decode pipeline planned | planned |
 | AV1   | Capability query wired; session/decode pipeline planned | planned |
 | VP9   | — | — |

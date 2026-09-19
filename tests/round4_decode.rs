@@ -151,7 +151,7 @@ fn h264_decoder_constructs_full_pipeline() {
     // dispatch itself is exercised by `h264_decoder_attempts_decode`
     // below (which forks to absorb the NVIDIA driver SIGSEGV).
     std::env::set_var("OXIDEAV_VK_SKIP_SUBMIT", "1");
-    let result = dec.send_packet(&pkt);
+    let result = dec.send_packet(&pkt).and_then(|_| dec.flush());
     std::env::remove_var("OXIDEAV_VK_SKIP_SUBMIT");
 
     // Expect the soft-fail "OXIDEAV_VK_SKIP_SUBMIT set" error,
@@ -202,21 +202,13 @@ fn h264_decoder_attempts_decode() {
         return;
     }
 
-    // Locate the helper binary built alongside this test crate.
-    let mut helper = std::env::current_exe().expect("current_exe");
-    // current_exe() is .../deps/round4_decode-<hash>; the helper
-    // sits next to it as round4_decode_helper.
-    helper.pop();
-    helper.pop();
-    helper.push("round4_decode_helper");
-    if !helper.exists() {
-        eprintln!(
-            "vulkan-video round4: helper binary missing ({:?}); \
-             cargo couldn't find the [[bin]] target — skipping",
-            helper
-        );
-        return;
-    }
+    // Cargo exposes the exact path of binary targets to integration tests.
+    // Using this avoids platform-specific .exe handling and target/deps layout guesses.
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_round4_decode_helper"));
+    assert!(
+        helper.exists(),
+        "round4 decode helper missing at {helper:?}"
+    );
 
     let output_path = fixtures_dir().join("decoded_output.yuv");
     let _ = std::fs::remove_file(&output_path);
@@ -319,6 +311,79 @@ fn h264_decoder_attempts_decode() {
     let _: Option<Frame> = None;
 }
 
+#[test]
+fn h264_decoder_decodes_inter_frame_gop() {
+    let fixture = fixtures_dir().join("h264_high_160x96_gop12.h264");
+    let reference_path = fixtures_dir().join("h264_high_160x96_gop12_reference.yuv");
+    if !fixture.exists() || !reference_path.exists() {
+        eprintln!("vulkan-video round4: inter-frame fixture missing; skipping");
+        return;
+    }
+    if oxideav_vulkan_video::sys::framework().is_err() {
+        eprintln!("vulkan-video round4: no Vulkan loader; skipping");
+        return;
+    }
+
+    let helper = PathBuf::from(env!("CARGO_BIN_EXE_round4_decode_helper"));
+    let output_path = std::env::temp_dir().join(format!(
+        "oxideav-vulkan-video-gop12-{}.yuv",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&output_path);
+
+    let status = Command::new(&helper)
+        .env_remove("OXIDEAV_VK_SKIP_SUBMIT")
+        .env_remove("OXIDEAV_VK_SKIP_DECODE")
+        .env("OXIDEAV_VK_DECODE_OUTPUT", &output_path)
+        .env("OXIDEAV_VK_FIXTURE", &fixture)
+        .status()
+        .expect("spawn inter-frame decode helper");
+
+    if !status.success() {
+        if let Some(sig) = status_signal(&status) {
+            panic!("vulkan-video round4: inter-frame helper crashed with signal {sig}");
+        }
+        if status.code() == Some(2) {
+            panic!(
+                "vulkan-video round4: inter-frame helper rejected a stream that should be supported"
+            );
+        }
+        panic!(
+            "vulkan-video round4: inter-frame helper exited abnormally: {:?}",
+            status.code()
+        );
+    }
+
+    let decoded =
+        std::fs::read(&output_path).expect("inter-frame helper exited 0 but produced no output");
+    let reference = std::fs::read(&reference_path).expect("read inter-frame ffmpeg reference");
+    const FRAME_BYTES: usize = 160 * 96 * 3 / 2;
+    assert_eq!(
+        reference.len(),
+        FRAME_BYTES * 12,
+        "reference fixture must contain 12 frames"
+    );
+    assert_eq!(
+        decoded.len(),
+        reference.len(),
+        "Vulkan decoder must emit all 12 display-order frames"
+    );
+
+    let mut total_abs = 0u64;
+    let mut max_abs = 0u8;
+    for (&actual, &expected) in decoded.iter().zip(&reference) {
+        let delta = (actual as i16 - expected as i16).unsigned_abs() as u8;
+        total_abs += delta as u64;
+        max_abs = max_abs.max(delta);
+    }
+    let mean_abs = total_abs as f64 / decoded.len() as f64;
+    eprintln!("inter-frame GOP vs ffmpeg: mean abs diff={mean_abs:.4}/255 max abs diff={max_abs}");
+    assert!(
+        mean_abs < 1.0,
+        "inter-frame Vulkan output differs materially from ffmpeg reference: mean abs diff={mean_abs}"
+    );
+    let _ = std::fs::remove_file(&output_path);
+}
 #[cfg(unix)]
 fn status_signal(s: &std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
