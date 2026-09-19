@@ -137,6 +137,23 @@ fn align_up(v: u64, align: u64) -> u64 {
     }
 }
 
+fn bitstream_buffer_capacity(coded_width: u32, coded_height: u32, alignment: u64) -> u64 {
+    let coded_pixels = u64::from(coded_width).saturating_mul(u64::from(coded_height));
+    let picture_budget = coded_pixels.saturating_mul(2).max(4 * 1024 * 1024);
+    align_up(picture_budget, alignment.max(1))
+}
+
+fn output_dimensions(
+    display_width: u32,
+    display_height: u32,
+    coded_width: u32,
+    coded_height: u32,
+) -> (u32, u32, u32) {
+    let width = display_width.min(coded_width);
+    let height = display_height.min(coded_height);
+    (width, height, height.div_ceil(2))
+}
+
 /// Walk the Annex-B bitstream and return the byte offsets (relative
 /// to the start of `bitstream`) of each VCL slice's start-code prefix.
 ///
@@ -1371,16 +1388,19 @@ impl DecoderState {
         };
 
         // ── Bitstream buffer (host-visible) ─────────────────────
-        // Generous size — the full Annex-B picture for a small fixture
-        // is well under 64 KiB. Caller can re-create on resize, this is
-        // a Round-4 simplification.
+        //
+        // Real 1080p IDR access units routinely exceed 64 KiB. Size this from
+        // the coded picture rather than a fixture-era constant; two bytes per
+        // coded pixel plus a 4 MiB floor leaves ample headroom for compressed
+        // picture overhead while keeping even 4K allocations modest.
+        let bitstream_size =
+            bitstream_buffer_capacity(max_w, max_h, caps.min_bitstream_buffer_size_alignment);
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
             eprintln!(
-                "vulkan-video: creating bitstream buffer (coincide={})",
-                coincide
+                "vulkan-video: creating bitstream buffer size={} (coincide={})",
+                bitstream_size, coincide
             );
         }
-        let bitstream_size = align_up(65536, caps.min_bitstream_buffer_offset_alignment.max(1));
         let buffer_ci = VkBufferCreateInfo {
             s_type: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             p_next: &profile_list as *const _ as *const c_void,
@@ -1478,11 +1498,12 @@ impl DecoderState {
         // (VUID-vkCmdCopyImageToBuffer-pRegions-00183).
         let luma_stride = max_w;
         let chroma_stride_texels = max_w.div_ceil(2);
-        let chroma_height = max_h.div_ceil(2);
+        let staging_chroma_height = max_h.div_ceil(2);
         // bytes-per-row for staging budget: luma 1 byte/texel,
-        // chroma 2 bytes/texel.
+        // chroma 2 bytes/texel. Allocate for the full coded extent; the
+        // readback region itself may be cropped to smaller display dimensions.
         let staging_size = (luma_stride as u64) * (max_h as u64)
-            + (chroma_stride_texels as u64) * 2 * (chroma_height as u64);
+            + (chroma_stride_texels as u64) * 2 * (staging_chroma_height as u64);
         let staging_size = staging_size.max(1024);
 
         let staging_ci = VkBufferCreateInfo {
@@ -1595,6 +1616,8 @@ impl DecoderState {
             eprintln!("vulkan-video: command pool + buffer OK");
         }
         let (display_width, display_height) = display_dimensions(sps);
+        let (output_width, output_height, output_chroma_height) =
+            output_dimensions(display_width, display_height, max_w, max_h);
         Ok(Self {
             command_buffer,
             command_pool,
@@ -1622,11 +1645,11 @@ impl DecoderState {
             physical_device_handle: pd_handle,
             device,
             instance,
-            width: display_width.min(max_w),
-            height: display_height.min(max_h),
+            width: output_width,
+            height: output_height,
             luma_stride,
             chroma_stride: chroma_stride_texels,
-            chroma_height,
+            chroma_height: output_chroma_height,
             coincide,
             dpb_slot_count: dpb_slots,
             dpb_initialized: false,
@@ -2134,11 +2157,16 @@ impl DecoderState {
         }
         self.needs_reset = false;
 
-        let mut frame_y = vec![0u8; (self.width as usize) * (self.height as usize)];
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let lstride = self.luma_stride as usize;
         let cw = self.width.div_ceil(2) as usize;
         let ch = self.chroma_height as usize;
-        let mut frame_u = vec![0u8; cw * ch];
-        let mut frame_v = vec![0u8; cw * ch];
+        let cstride_bytes = (self.chroma_stride as usize) * 2;
+        let chroma_off = lstride * height;
+
+        let mut frame_y = vec![0u8; width * height];
+        let mut cached_uv = vec![0u8; cstride_bytes * ch];
 
         unsafe {
             let mut p: *mut c_void = ptr::null_mut();
@@ -2154,22 +2182,40 @@ impl DecoderState {
                 return Err(vk_err("vkMapMemory(staging)", r));
             }
             let host = p as *const u8;
-            let lstride = self.luma_stride as usize;
-            for y in 0..self.height as usize {
-                let src = host.add(y * lstride);
-                let dst = frame_y.as_mut_ptr().add(y * self.width as usize);
-                std::ptr::copy_nonoverlapping(src, dst, self.width as usize);
-            }
-            let chroma_off = (self.luma_stride as usize) * (self.height as usize);
-            let cstride_bytes = (self.chroma_stride as usize) * 2;
-            for y in 0..ch {
-                for x in 0..cw {
-                    let src_pair = host.add(chroma_off + y * cstride_bytes + x * 2);
-                    frame_u[y * cw + x] = *src_pair;
-                    frame_v[y * cw + x] = *src_pair.add(1);
+
+            // Host-visible GPU memory can be effectively uncached for fine-grained
+            // CPU reads. Bulk-copy each plane into ordinary cached RAM first;
+            // deinterleaving UV directly from the mapped allocation was the
+            // dominant 720p60 cost on NVIDIA (tens of milliseconds per frame).
+            if lstride == width {
+                std::ptr::copy_nonoverlapping(host, frame_y.as_mut_ptr(), frame_y.len());
+            } else {
+                for y in 0..height {
+                    std::ptr::copy_nonoverlapping(
+                        host.add(y * lstride),
+                        frame_y.as_mut_ptr().add(y * width),
+                        width,
+                    );
                 }
             }
+            std::ptr::copy_nonoverlapping(
+                host.add(chroma_off),
+                cached_uv.as_mut_ptr(),
+                cached_uv.len(),
+            );
             (self.device.fns().unmap_memory)(self.device.handle(), self.staging_memory);
+        }
+
+        let mut frame_u = vec![0u8; cw * ch];
+        let mut frame_v = vec![0u8; cw * ch];
+        for y in 0..ch {
+            let src_row = &cached_uv[y * cstride_bytes..y * cstride_bytes + cw * 2];
+            let u_row = &mut frame_u[y * cw..(y + 1) * cw];
+            let v_row = &mut frame_v[y * cw..(y + 1) * cw];
+            for (x, pair) in src_row.chunks_exact(2).enumerate() {
+                u_row[x] = pair[0];
+                v_row[x] = pair[1];
+            }
         }
 
         Ok(VideoFrame {
@@ -2505,5 +2551,24 @@ fn h264_level_byte_to_idc(b: u8) -> sys::StdVideoH264LevelIdc {
         61 => 17, // 6.1
         62 => 18, // 6.2
         _ => 14,  // default to 5.1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bitstream_buffer_capacity, output_dimensions};
+
+    #[test]
+    fn bitstream_buffer_capacity_handles_real_1080p_access_units() {
+        let capacity = bitstream_buffer_capacity(1920, 1088, 4096);
+        assert!(capacity > 160_928);
+        assert!(capacity >= 4 * 1024 * 1024);
+        assert_eq!(capacity % 4096, 0);
+    }
+
+    #[test]
+    fn cropped_output_geometry_uses_display_chroma_height() {
+        assert_eq!(output_dimensions(1920, 1080, 1920, 1088), (1920, 1080, 540));
+        assert_eq!(output_dimensions(284, 160, 288, 160), (284, 160, 80));
     }
 }

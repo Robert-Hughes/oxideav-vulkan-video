@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Map live H.264 DPB keys to Vulkan DPB slots, submit real per-picture/reference metadata, preserve DPB image contents across pictures, reset video-session state only when required, and read back the reconstructed layer selected for each picture.
 - Add a 12-frame High-profile IDR/P/B regression fixture; GTX 1080 Vulkan Video output matches the ffmpeg-decoded I420 reference byte-for-byte.
 
+### Fixed
+
+- Size the host-visible H.264 bitstream buffer from coded dimensions instead of a 64 KiB fixture-era constant, preventing large 1080p IDR access units from being skipped and poisoning subsequent DPB/frame-number state.
+- Crop chroma readback to display height as well as luma, so 1920x1088-coded / 1920x1080-displayed streams return 540 chroma rows rather than 544.
+- Bulk-copy NV12 staging data out of host-visible Vulkan memory before CPU deinterleave; on GTX 1080 this reduces 720p readback/unpack from about 36.5 ms to 3.3 ms per frame and restores real-time 60 fps headroom.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-vulkan-video/compare/v0.0.1...v0.0.2) - 2026-08-23
 
 ### Other
