@@ -30,17 +30,18 @@ use crate::physical_device::PhysicalDevice;
 use crate::sys::{
     FnVkAllocateCommandBuffers, FnVkAllocateMemory, FnVkBeginCommandBuffer, FnVkBindBufferMemory,
     FnVkBindImageMemory, FnVkBindVideoSessionMemoryKHR, FnVkCmdBeginVideoCodingKHR,
-    FnVkCmdControlVideoCodingKHR, FnVkCmdCopyImageToBuffer, FnVkCmdDecodeVideoKHR,
-    FnVkCmdEndVideoCodingKHR, FnVkCmdPipelineBarrier, FnVkCreateBuffer, FnVkCreateCommandPool,
-    FnVkCreateFence, FnVkCreateImage, FnVkCreateImageView, FnVkCreateVideoSessionKHR,
-    FnVkCreateVideoSessionParametersKHR, FnVkDestroyBuffer, FnVkDestroyCommandPool,
-    FnVkDestroyDevice, FnVkDestroyFence, FnVkDestroyImage, FnVkDestroyImageView,
-    FnVkDestroyVideoSessionKHR, FnVkDestroyVideoSessionParametersKHR, FnVkEndCommandBuffer,
-    FnVkFreeCommandBuffers, FnVkFreeMemory, FnVkGetBufferMemoryRequirements, FnVkGetDeviceProcAddr,
-    FnVkGetDeviceQueue, FnVkGetImageMemoryRequirements, FnVkGetVideoSessionMemoryRequirementsKHR,
-    FnVkMapMemory, FnVkQueueSubmit, FnVkQueueWaitIdle, FnVkUnmapMemory, FnVkWaitForFences,
-    VkDevice, VkDeviceCreateInfo, VkDeviceQueueCreateInfo, VkQueue,
-    VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, VK_SUCCESS,
+    FnVkCmdControlVideoCodingKHR, FnVkCmdCopyImage, FnVkCmdCopyImageToBuffer,
+    FnVkCmdDecodeVideoKHR, FnVkCmdEndVideoCodingKHR, FnVkCmdPipelineBarrier, FnVkCreateBuffer,
+    FnVkCreateCommandPool, FnVkCreateFence, FnVkCreateImage, FnVkCreateImageView,
+    FnVkCreateVideoSessionKHR, FnVkCreateVideoSessionParametersKHR, FnVkDestroyBuffer,
+    FnVkDestroyCommandPool, FnVkDestroyDevice, FnVkDestroyFence, FnVkDestroyImage,
+    FnVkDestroyImageView, FnVkDestroyVideoSessionKHR, FnVkDestroyVideoSessionParametersKHR,
+    FnVkEndCommandBuffer, FnVkFreeCommandBuffers, FnVkFreeMemory, FnVkGetBufferMemoryRequirements,
+    FnVkGetDeviceProcAddr, FnVkGetDeviceQueue, FnVkGetImageMemoryRequirements,
+    FnVkGetVideoSessionMemoryRequirementsKHR, FnVkMapMemory, FnVkQueueSubmit, FnVkQueueWaitIdle,
+    FnVkUnmapMemory, FnVkWaitForFences, VkDevice, VkDeviceCreateInfo, VkDeviceQueueCreateInfo,
+    VkQueue, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+    VK_SUCCESS,
 };
 
 /// Default per-queue priority. Vulkan only requires the values to lie
@@ -112,6 +113,7 @@ pub(crate) struct DeviceFns {
     pub(crate) end_command_buffer: FnVkEndCommandBuffer,
     pub(crate) cmd_pipeline_barrier: FnVkCmdPipelineBarrier,
     pub(crate) cmd_copy_image_to_buffer: FnVkCmdCopyImageToBuffer,
+    pub(crate) cmd_copy_image: FnVkCmdCopyImage,
 
     pub(crate) queue_submit: FnVkQueueSubmit,
     pub(crate) queue_wait_idle: FnVkQueueWaitIdle,
@@ -461,6 +463,7 @@ impl DeviceFns {
                     device,
                     b"vkCmdCopyImageToBuffer\0",
                 )?,
+                cmd_copy_image: load_device_fn(get_device_proc, device, b"vkCmdCopyImage\0")?,
                 queue_submit: load_device_fn(get_device_proc, device, b"vkQueueSubmit\0")?,
                 queue_wait_idle: load_device_fn(get_device_proc, device, b"vkQueueWaitIdle\0")?,
                 create_fence: load_device_fn(get_device_proc, device, b"vkCreateFence\0")?,
@@ -517,6 +520,10 @@ pub struct ExternalDevice {
     /// submit to. `0` unless the application reserves queue 0 of the
     /// family for its own submissions.
     pub queue_index: u32,
+    /// Queue family that will consume direct presentation images. When this
+    /// differs from the decode queue family, direct images are created with
+    /// concurrent sharing across both families.
+    pub consumer_queue_family_index: Option<u32>,
     /// `vkGetInstanceProcAddr` of the loader the instance was created
     /// with. `None` means "resolve through the system Vulkan loader"
     /// (correct whenever the application itself went through
@@ -524,6 +531,9 @@ pub struct ExternalDevice {
     /// common case — including `ash::Entry::load()`).
     pub get_instance_proc_addr: Option<crate::sys::FnVkGetInstanceProcAddr>,
 }
+
+unsafe impl Send for ExternalDevice {}
+unsafe impl Sync for ExternalDevice {}
 
 impl std::fmt::Debug for ExternalDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -533,6 +543,10 @@ impl std::fmt::Debug for ExternalDevice {
             .field("device", &self.device)
             .field("queue_family_index", &self.queue_family_index)
             .field("queue_index", &self.queue_index)
+            .field(
+                "consumer_queue_family_index",
+                &self.consumer_queue_family_index,
+            )
             .field(
                 "get_instance_proc_addr",
                 &self.get_instance_proc_addr.map(|_| "<fn>"),
@@ -556,6 +570,7 @@ impl ExternalDevice {
             device,
             queue_family_index,
             queue_index: 0,
+            consumer_queue_family_index: None,
             get_instance_proc_addr: None,
         }
     }
@@ -563,6 +578,13 @@ impl ExternalDevice {
     /// Builder-style override of [`ExternalDevice::queue_index`].
     pub fn with_queue_index(mut self, queue_index: u32) -> Self {
         self.queue_index = queue_index;
+        self
+    }
+
+    /// Builder-style declaration of the queue family that will consume direct
+    /// presentation images produced by the decoder.
+    pub fn with_consumer_queue_family_index(mut self, queue_family_index: u32) -> Self {
+        self.consumer_queue_family_index = Some(queue_family_index);
         self
     }
 

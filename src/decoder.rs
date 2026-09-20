@@ -55,9 +55,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, FrameLease, HardwareVideoFrame,
+    HardwareVideoFrameStorage, Packet, PixelFormat, Result, VideoFrame, VideoPlane,
 };
 use oxideav_h264::access_unit::{starts_with_annex_b, AnnexBAccessUnitAssembler};
 use oxideav_h264::dpb_output::{DpbOutput, OutputEntry};
@@ -78,29 +80,31 @@ use crate::sys::{
     StdVideoH264SequenceParameterSet, StdVideoH264SpsFlags, VkBuffer, VkBufferCreateInfo,
     VkBufferImageCopy, VkCommandBuffer, VkCommandBufferAllocateInfo, VkCommandBufferBeginInfo,
     VkCommandPool, VkCommandPoolCreateInfo, VkComponentMapping, VkDeviceMemory, VkExtent2D,
-    VkExtent3D, VkImage, VkImageCreateInfo, VkImageMemoryBarrier, VkImageSubresourceLayers,
-    VkImageSubresourceRange, VkImageView, VkImageViewCreateInfo, VkMemoryAllocateInfo,
-    VkMemoryRequirements, VkOffset2D, VkOffset3D, VkPhysicalDeviceMemoryProperties, VkSubmitInfo,
-    VkVideoBeginCodingInfoKHR, VkVideoCodingControlInfoKHR, VkVideoDecodeH264DpbSlotInfoKHR,
-    VkVideoDecodeH264PictureInfoKHR, VkVideoDecodeH264ProfileInfoKHR,
-    VkVideoDecodeH264SessionParametersAddInfoKHR, VkVideoDecodeH264SessionParametersCreateInfoKHR,
-    VkVideoDecodeInfoKHR, VkVideoEndCodingInfoKHR, VkVideoPictureResourceInfoKHR,
-    VkVideoProfileInfoKHR, VkVideoProfileListInfoKHR, VkVideoReferenceSlotInfoKHR,
-    VkVideoSessionParametersCreateInfoKHR, VkVideoSessionParametersKHR, VK_ACCESS_MEMORY_READ_BIT,
-    VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_API_VERSION_1_2,
+    VkExtent3D, VkImage, VkImageCopy, VkImageCreateInfo, VkImageMemoryBarrier,
+    VkImageSubresourceLayers, VkImageSubresourceRange, VkImageView, VkImageViewCreateInfo,
+    VkMemoryAllocateInfo, VkMemoryRequirements, VkOffset2D, VkOffset3D,
+    VkPhysicalDeviceMemoryProperties, VkSubmitInfo, VkVideoBeginCodingInfoKHR,
+    VkVideoCodingControlInfoKHR, VkVideoDecodeH264DpbSlotInfoKHR, VkVideoDecodeH264PictureInfoKHR,
+    VkVideoDecodeH264ProfileInfoKHR, VkVideoDecodeH264SessionParametersAddInfoKHR,
+    VkVideoDecodeH264SessionParametersCreateInfoKHR, VkVideoDecodeInfoKHR, VkVideoEndCodingInfoKHR,
+    VkVideoPictureResourceInfoKHR, VkVideoProfileInfoKHR, VkVideoProfileListInfoKHR,
+    VkVideoReferenceSlotInfoKHR, VkVideoSessionParametersCreateInfoKHR,
+    VkVideoSessionParametersKHR, VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_API_VERSION_1_2,
     VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR,
     VK_COMMAND_BUFFER_LEVEL_PRIMARY, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
     VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_PLANE_0_BIT, VK_IMAGE_ASPECT_PLANE_1_BIT,
-    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_UNDEFINED,
-    VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR, VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR,
-    VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_TYPE_2D, VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR,
+    VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_TYPE_2D,
+    VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
     VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR, VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR,
     VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_QUEUE_FAMILY_IGNORED, VK_SAMPLE_COUNT_1_BIT,
-    VK_SHARING_MODE_EXCLUSIVE, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    VK_SHARING_MODE_CONCURRENT, VK_SHARING_MODE_EXCLUSIVE, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
     VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
     VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
     VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -231,6 +235,118 @@ fn pick_memory_type(
     }
     None
 }
+fn create_direct_surface_pool(
+    device: &Device,
+    mem_props: &VkPhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+    decode_queue_family_index: u32,
+    consumer_queue_family_index: u32,
+) -> Result<Arc<DirectSurfacePool>> {
+    let mut pool = DirectSurfacePool {
+        device: device.handle(),
+        destroy_image: device.fns().destroy_image,
+        free_memory: device.fns().free_memory,
+        surfaces: Vec::with_capacity(DIRECT_SURFACE_POOL_SIZE),
+        state: Mutex::new(DirectSurfacePoolState {
+            in_use: Vec::with_capacity(DIRECT_SURFACE_POOL_SIZE),
+            initialized: Vec::with_capacity(DIRECT_SURFACE_POOL_SIZE),
+        }),
+    };
+
+    let queue_families = [decode_queue_family_index, consumer_queue_family_index];
+    let concurrent = decode_queue_family_index != consumer_queue_family_index;
+    let image_ci = VkImageCreateInfo {
+        s_type: VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        p_next: ptr::null(),
+        flags: 0,
+        image_type: VK_IMAGE_TYPE_2D,
+        format: VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+        extent: VkExtent3D {
+            width,
+            height,
+            depth: 1,
+        },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: VK_SAMPLE_COUNT_1_BIT,
+        tiling: VK_IMAGE_TILING_OPTIMAL,
+        usage: VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        sharing_mode: if concurrent {
+            VK_SHARING_MODE_CONCURRENT
+        } else {
+            VK_SHARING_MODE_EXCLUSIVE
+        },
+        queue_family_index_count: if concurrent { 2 } else { 0 },
+        p_queue_family_indices: if concurrent {
+            queue_families.as_ptr()
+        } else {
+            ptr::null()
+        },
+        initial_layout: VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    for _ in 0..DIRECT_SURFACE_POOL_SIZE {
+        let mut image: VkImage = ptr::null_mut();
+        let result = unsafe {
+            (device.fns().create_image)(device.handle(), &image_ci, ptr::null(), &mut image)
+        };
+        if result != VK_SUCCESS {
+            return Err(vk_err("vkCreateImage(direct presentation)", result));
+        }
+
+        let mut requirements = VkMemoryRequirements::default();
+        unsafe {
+            (device.fns().get_image_memory_requirements)(device.handle(), image, &mut requirements);
+        }
+        let memory_type = match pick_memory_type(
+            mem_props,
+            requirements.memory_type_bits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        ) {
+            Some(index) => index,
+            None => {
+                unsafe { (device.fns().destroy_image)(device.handle(), image, ptr::null()) };
+                return Err(Error::other(
+                    "vulkan-video: no device-local memory for direct presentation image",
+                ));
+            }
+        };
+
+        let alloc = VkMemoryAllocateInfo {
+            s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            p_next: ptr::null(),
+            allocation_size: requirements.size,
+            memory_type_index: memory_type,
+        };
+        let mut memory: VkDeviceMemory = ptr::null_mut();
+        let result = unsafe {
+            (device.fns().allocate_memory)(device.handle(), &alloc, ptr::null(), &mut memory)
+        };
+        if result != VK_SUCCESS {
+            unsafe { (device.fns().destroy_image)(device.handle(), image, ptr::null()) };
+            return Err(vk_err("vkAllocateMemory(direct presentation)", result));
+        }
+        let result = unsafe { (device.fns().bind_image_memory)(device.handle(), image, memory, 0) };
+        if result != VK_SUCCESS {
+            unsafe {
+                (device.fns().free_memory)(device.handle(), memory, ptr::null());
+                (device.fns().destroy_image)(device.handle(), image, ptr::null());
+            }
+            return Err(vk_err("vkBindImageMemory(direct presentation)", result));
+        }
+
+        pool.surfaces.push(DirectSurface { image, memory });
+        let state = pool
+            .state
+            .get_mut()
+            .map_err(|_| Error::other("vulkan-video: direct surface pool mutex poisoned"))?;
+        state.in_use.push(false);
+        state.initialized.push(false);
+    }
+
+    Ok(Arc::new(pool))
+}
 
 /// Wrapper that owns the Vulkan objects backing one decode session.
 ///
@@ -275,6 +391,11 @@ struct DecoderState {
     dpb_image_view: VkImageView,
     dpb_image: VkImage,
     dpb_memory: VkDeviceMemory,
+
+    /// GPU-only presentation surfaces used by direct output. This Arc lets
+    /// outstanding hardware-frame leases keep their VkImage storage alive
+    /// across decoder reset / quality-switch teardown.
+    direct_pool: Option<Arc<DirectSurfacePool>>,
 
     session_params: VkVideoSessionParametersKHR,
     /// Owns `vkDestroyVideoSessionKHR`. Must drop before `device`.
@@ -326,6 +447,7 @@ struct DecoderState {
     output_initialized: bool,
     /// Vulkan coding state must be RESET on the first decode submission.
     needs_reset: bool,
+    output_mode: DecoderOutputMode,
 
     /// Bitstream buffer offset alignment from caps. Currently unused
     /// (we use the size alignment for the decode srcBufferRange) but
@@ -484,6 +606,209 @@ impl Drop for DecoderState {
 
 // ─────────────────────────── public decoder ──────────────────────────────────
 
+const DIRECT_SURFACE_POOL_SIZE: usize = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecoderOutputMode {
+    Readback,
+    Direct { consumer_queue_family_index: u32 },
+}
+
+struct DirectSurface {
+    image: VkImage,
+    memory: VkDeviceMemory,
+}
+
+struct DirectSurfacePoolState {
+    in_use: Vec<bool>,
+    initialized: Vec<bool>,
+}
+
+struct DirectSurfacePool {
+    device: sys::VkDevice,
+    destroy_image: sys::FnVkDestroyImage,
+    free_memory: sys::FnVkFreeMemory,
+    surfaces: Vec<DirectSurface>,
+    state: Mutex<DirectSurfacePoolState>,
+}
+
+unsafe impl Send for DirectSurfacePool {}
+unsafe impl Sync for DirectSurfacePool {}
+
+impl DirectSurfacePool {
+    fn acquire(self: &Arc<Self>) -> Result<DirectSurfaceLease> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::other("vulkan-video: direct surface pool mutex poisoned"))?;
+        let Some(index) = state.in_use.iter().position(|busy| !*busy) else {
+            return Err(Error::other(
+                "vulkan-video: direct presentation surface pool exhausted",
+            ));
+        };
+        state.in_use[index] = true;
+        drop(state);
+        Ok(DirectSurfaceLease {
+            pool: Arc::clone(self),
+            index,
+        })
+    }
+
+    fn image(&self, index: usize) -> VkImage {
+        self.surfaces[index].image
+    }
+
+    fn is_initialized(&self, index: usize) -> Result<bool> {
+        self.state
+            .lock()
+            .map(|state| state.initialized[index])
+            .map_err(|_| Error::other("vulkan-video: direct surface pool mutex poisoned"))
+    }
+
+    fn mark_initialized(&self, index: usize) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::other("vulkan-video: direct surface pool mutex poisoned"))?;
+        state.initialized[index] = true;
+        Ok(())
+    }
+
+    fn release(&self, index: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_use[index] = false;
+        }
+    }
+}
+
+impl Drop for DirectSurfacePool {
+    fn drop(&mut self) {
+        unsafe {
+            for surface in &self.surfaces {
+                if !surface.image.is_null() {
+                    (self.destroy_image)(self.device, surface.image, ptr::null());
+                }
+                if !surface.memory.is_null() {
+                    (self.free_memory)(self.device, surface.memory, ptr::null());
+                }
+            }
+        }
+    }
+}
+
+struct DirectSurfaceLease {
+    pool: Arc<DirectSurfacePool>,
+    index: usize,
+}
+
+impl DirectSurfaceLease {
+    fn image(&self) -> VkImage {
+        self.pool.image(self.index)
+    }
+
+    fn initialized(&self) -> Result<bool> {
+        self.pool.is_initialized(self.index)
+    }
+
+    fn mark_initialized(&self) -> Result<()> {
+        self.pool.mark_initialized(self.index)
+    }
+}
+
+impl Drop for DirectSurfaceLease {
+    fn drop(&mut self) {
+        self.pool.release(self.index);
+    }
+}
+
+/// Retained GPU-only NV12 output produced by the Vulkan Video direct decoder.
+///
+/// The image is a single-layer NV12 Vulkan image in TRANSFER_SRC_OPTIMAL.
+/// The enclosing hardware frame lease keeps the image and backing memory alive
+/// and prevents the decoder from recycling the presentation slot until the
+/// consumer drops the lease.
+pub struct VulkanVideoFrameStorage {
+    surface: DirectSurfaceLease,
+    width: u32,
+    height: u32,
+    pts: Option<i64>,
+}
+
+impl VulkanVideoFrameStorage {
+    /// Raw NV12 VkImage handle for same-device presentation bridges.
+    pub fn image(&self) -> sys::VkImage {
+        self.surface.image()
+    }
+
+    /// Raw VkDevice that owns the image.
+    pub fn device(&self) -> sys::VkDevice {
+        self.surface.pool.device
+    }
+}
+
+unsafe impl Send for VulkanVideoFrameStorage {}
+unsafe impl Sync for VulkanVideoFrameStorage {}
+
+impl HardwareVideoFrameStorage for VulkanVideoFrameStorage {
+    fn backend(&self) -> &'static str {
+        "vulkan-video"
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn pixel_format(&self) -> PixelFormat {
+        PixelFormat::Nv12
+    }
+
+    fn pts(&self) -> Option<i64> {
+        self.pts
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn materialize(&self) -> Result<VideoFrame> {
+        Err(Error::unsupported(
+            "vulkan-video: direct GPU frame cannot be materialised; request the readback decoder",
+        ))
+    }
+}
+
+enum DecodedPicture {
+    Readback(VideoFrame),
+    Direct(VulkanVideoFrameStorage),
+}
+
+impl DecodedPicture {
+    fn set_pts(&mut self, pts: Option<i64>) {
+        match self {
+            Self::Readback(frame) => frame.pts = pts,
+            Self::Direct(frame) => frame.pts = pts,
+        }
+    }
+
+    fn into_frame(self) -> Result<Frame> {
+        match self {
+            Self::Readback(frame) => Ok(Frame::Video(frame)),
+            Self::Direct(frame) => frame.materialize().map(Frame::Video),
+        }
+    }
+
+    fn into_lease(self) -> FrameLease {
+        match self {
+            Self::Readback(frame) => FrameLease::from_frame(Frame::Video(frame)),
+            Self::Direct(frame) => FrameLease::from_hardware_video(HardwareVideoFrame::new(frame)),
+        }
+    }
+}
+
 /// Vulkan Video H.264 streaming decoder.
 ///
 /// Parsing, POC derivation and decoded-reference-picture marking are delegated
@@ -498,15 +823,30 @@ pub struct H264VkDecoder {
     /// DPB slots that Vulkan still considers active, including stale slots
     /// whose H.264 keys have already left the frontend DPB.
     active_slots: HashSet<u32>,
-    output_dpb: DpbOutput<VideoFrame>,
-    ready: VecDeque<VideoFrame>,
+    output_dpb: DpbOutput<DecodedPicture>,
+    ready: VecDeque<DecodedPicture>,
     eof: bool,
     device_index: u32,
     external: Option<ExternalDevice>,
+    output_mode: DecoderOutputMode,
+}
+
+fn validate_factory_params(params: &CodecParameters) -> Result<()> {
+    sys::vtable().map_err(|e| Error::unsupported(format!("vulkan-video: {e}")))?;
+    if !params.extradata.is_empty() && !starts_with_annex_b(&params.extradata) {
+        return Err(Error::unsupported(
+            "vulkan-video: H.264 streaming decoder currently supports Annex-B input only",
+        ));
+    }
+    Ok(())
 }
 
 impl H264VkDecoder {
-    fn new(device_index: u32, external: Option<ExternalDevice>) -> Self {
+    fn new(
+        device_index: u32,
+        external: Option<ExternalDevice>,
+        output_mode: DecoderOutputMode,
+    ) -> Self {
         Self {
             codec_id: CodecId::new("h264"),
             au_assembler: AnnexBAccessUnitAssembler::default(),
@@ -519,21 +859,22 @@ impl H264VkDecoder {
             eof: false,
             device_index,
             external,
+            output_mode,
         }
     }
 
-    /// Factory used by the framework registry.
+    /// Factory used by the framework registry for CPU readback output.
     pub fn make(params: &CodecParameters) -> Result<Box<dyn oxideav_core::Decoder>> {
         sys::vtable().map_err(|e| Error::unsupported(format!("vulkan-video: {e}")))?;
-        if !params.extradata.is_empty() && !starts_with_annex_b(&params.extradata) {
-            return Err(Error::unsupported(
-                "vulkan-video: H.264 streaming decoder currently supports Annex-B input only",
-            ));
-        }
-        Ok(Box::new(Self::new(params.device_index.unwrap_or(0), None)))
+        validate_factory_params(params)?;
+        Ok(Box::new(Self::new(
+            params.device_index.unwrap_or(0),
+            None,
+            DecoderOutputMode::Readback,
+        )))
     }
 
-    /// Construct a decoder that runs on an application-owned Vulkan device.
+    /// Construct a readback decoder that runs on an application-owned Vulkan device.
     ///
     /// # Safety
     ///
@@ -544,12 +885,39 @@ impl H264VkDecoder {
         params: &CodecParameters,
         external: ExternalDevice,
     ) -> Result<Box<dyn oxideav_core::Decoder>> {
-        if !params.extradata.is_empty() && !starts_with_annex_b(&params.extradata) {
-            return Err(Error::unsupported(
-                "vulkan-video: H.264 streaming decoder currently supports Annex-B input only",
-            ));
-        }
-        Ok(Box::new(Self::new(0, Some(external))))
+        validate_factory_params(params)?;
+        Ok(Box::new(Self::new(
+            0,
+            Some(external),
+            DecoderOutputMode::Readback,
+        )))
+    }
+
+    /// Construct a GPU-only decoder on an application-owned Vulkan device.
+    ///
+    /// The returned decoder emits retained VulkanVideoFrameStorage leases
+    /// instead of copying pixels to CPU memory.
+    ///
+    /// # Safety
+    ///
+    /// Same handle and queue-lifetime contract as `make_with_device`, except
+    /// that the application-owned device must also remain valid until every
+    /// outstanding `VulkanVideoFrameStorage` lease has been dropped.
+    pub unsafe fn make_direct_with_device(
+        params: &CodecParameters,
+        external: ExternalDevice,
+    ) -> Result<Box<dyn oxideav_core::Decoder>> {
+        validate_factory_params(params)?;
+        let consumer_queue_family_index = external
+            .consumer_queue_family_index
+            .unwrap_or(external.queue_family_index);
+        Ok(Box::new(Self::new(
+            0,
+            Some(external),
+            DecoderOutputMode::Direct {
+                consumer_queue_family_index,
+            },
+        )))
     }
 
     fn ensure_state(&mut self, sps: &Sps, pps: &Pps) -> Result<()> {
@@ -557,8 +925,8 @@ impl H264VkDecoder {
             return Ok(());
         }
         let state = match &self.external {
-            Some(ext) => DecoderState::create_external(sps, pps, ext)?,
-            None => DecoderState::create(sps, pps, self.device_index)?,
+            Some(ext) => DecoderState::create_external(sps, pps, ext, self.output_mode)?,
+            None => DecoderState::create(sps, pps, self.device_index, self.output_mode)?,
         };
         self.state = Some(state);
         Ok(())
@@ -675,7 +1043,7 @@ impl H264VkDecoder {
                 &self.dpb_slots,
                 reset_session,
             )?;
-        frame.pts = packet.pts;
+        frame.set_pts(packet.pts);
 
         let frame_num = picture.header.frame_num;
         let pic_order_cnt = picture.poc.pic_order_cnt;
@@ -750,7 +1118,17 @@ impl oxideav_core::Decoder for H264VkDecoder {
 
     fn receive_frame(&mut self) -> Result<Frame> {
         if let Some(frame) = self.ready.pop_front() {
-            return Ok(Frame::Video(frame));
+            return frame.into_frame();
+        }
+        if self.eof && self.output_dpb.is_empty() {
+            return Err(Error::Eof);
+        }
+        Err(Error::NeedMore)
+    }
+
+    fn receive_frame_lease(&mut self) -> Result<FrameLease> {
+        if let Some(frame) = self.ready.pop_front() {
+            return Ok(frame.into_lease());
         }
         if self.eof && self.output_dpb.is_empty() {
             return Err(Error::Eof);
@@ -778,7 +1156,12 @@ impl oxideav_core::Decoder for H264VkDecoder {
 // ─────────────────────────── DecoderState — heavy lifting ────────────────────
 
 impl DecoderState {
-    fn create(sps: &Sps, pps: &Pps, device_index: u32) -> Result<Self> {
+    fn create(
+        sps: &Sps,
+        pps: &Pps,
+        device_index: u32,
+        output_mode: DecoderOutputMode,
+    ) -> Result<Self> {
         // ── Instance ────────────────────────────────────────────
         let instance = Instance::new("oxideav-vulkan-video", VK_API_VERSION_1_2)
             .map_err(|e| Error::unsupported(format!("vulkan-video: {e}")))?;
@@ -888,7 +1271,7 @@ impl DecoderState {
         }
         drop(pds);
 
-        Self::build(sps, pps, instance, pd_handle, qfi, 0, device)
+        Self::build(sps, pps, instance, pd_handle, qfi, 0, device, output_mode)
     }
 
     /// Construct the decode pipeline on an application-supplied
@@ -904,7 +1287,12 @@ impl DecoderState {
     ///
     /// The `ExternalDevice` handles were vouched for by the caller of
     /// [`H264VkDecoder::make_with_device`]; see the contract there.
-    fn create_external(sps: &Sps, pps: &Pps, ext: &ExternalDevice) -> Result<Self> {
+    fn create_external(
+        sps: &Sps,
+        pps: &Pps,
+        ext: &ExternalDevice,
+        output_mode: DecoderOutputMode,
+    ) -> Result<Self> {
         // SAFETY: handle validity / lifetime / synchronisation were
         // guaranteed by the unsafe `make_with_device` caller.
         let (instance, device) = unsafe { ext.import() }
@@ -943,6 +1331,7 @@ impl DecoderState {
             ext.queue_family_index,
             ext.queue_index,
             device,
+            output_mode,
         )
     }
 
@@ -952,6 +1341,7 @@ impl DecoderState {
     /// family, and a `VkDevice` (owned or imported) — capability
     /// query, video session + parameters, DPB / output images,
     /// bitstream + staging buffers, command pool.
+    #[allow(clippy::too_many_arguments)] // Vulkan session construction inputs are intentionally explicit.
     fn build(
         sps: &Sps,
         pps: &Pps,
@@ -960,6 +1350,7 @@ impl DecoderState {
         qfi: u32,
         queue_index: u32,
         device: Device,
+        output_mode: DecoderOutputMode,
     ) -> Result<Self> {
         // ── Capabilities ────────────────────────────────────────
         if std::env::var("OXIDEAV_VK_TRACE").is_ok() {
@@ -1618,6 +2009,19 @@ impl DecoderState {
         let (display_width, display_height) = display_dimensions(sps);
         let (output_width, output_height, output_chroma_height) =
             output_dimensions(display_width, display_height, max_w, max_h);
+        let direct_pool = match output_mode {
+            DecoderOutputMode::Readback => None,
+            DecoderOutputMode::Direct {
+                consumer_queue_family_index,
+            } => Some(create_direct_surface_pool(
+                &device,
+                &mem_props,
+                output_width,
+                output_height,
+                qfi,
+                consumer_queue_family_index,
+            )?),
+        };
         Ok(Self {
             command_buffer,
             command_pool,
@@ -1633,6 +2037,7 @@ impl DecoderState {
             dpb_image_view,
             dpb_image,
             dpb_memory,
+            direct_pool,
             session_params,
             // SAFETY: extends the `'device` borrow on `video_session` to
             // `'static`; the session is owned by `Self` and dropped before
@@ -1655,6 +2060,7 @@ impl DecoderState {
             dpb_initialized: false,
             output_initialized: false,
             needs_reset: true,
+            output_mode,
             bitstream_offset_alignment: caps.min_bitstream_buffer_offset_alignment.max(1),
             bitstream_size_alignment: caps.min_bitstream_buffer_size_alignment.max(1),
         })
@@ -1668,7 +2074,7 @@ impl DecoderState {
         target_was_active: bool,
         slot_map: &HashMap<u32, u32>,
         reset_session: bool,
-    ) -> Result<VideoFrame> {
+    ) -> Result<DecodedPicture> {
         if target_slot >= self.dpb_slot_count {
             return Err(Error::invalid(format!(
                 "vulkan-video: target DPB slot {target_slot} exceeds {} allocated slots",
@@ -1911,6 +2317,18 @@ impl DecoderState {
             flags: 0,
         };
 
+        let direct_surface = match self.output_mode {
+            DecoderOutputMode::Readback => None,
+            DecoderOutputMode::Direct { .. } => Some(
+                self.direct_pool
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::other("vulkan-video: direct output pool is not initialised")
+                    })?
+                    .acquire()?,
+            ),
+        };
+
         let cb_begin = VkCommandBufferBeginInfo {
             s_type: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             p_next: ptr::null(),
@@ -2033,52 +2451,190 @@ impl DecoderState {
             );
         }
 
-        let luma_bytes = (self.luma_stride as u64) * (self.height as u64);
-        let regions = [
-            VkBufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: self.luma_stride,
-                buffer_image_height: self.height,
-                image_subresource: VkImageSubresourceLayers {
-                    aspect_mask: VK_IMAGE_ASPECT_PLANE_0_BIT,
-                    mip_level: 0,
-                    base_array_layer: output_layer,
+        if let Some(surface) = direct_surface.as_ref() {
+            let initialized = surface.initialized()?;
+            let direct_image = surface.image();
+            let to_direct_dst = VkImageMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: if initialized {
+                    VK_ACCESS_TRANSFER_READ_BIT
+                } else {
+                    0
+                },
+                dst_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                old_layout: if initialized {
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                } else {
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                },
+                new_layout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                image: direct_image,
+                subresource_range: VkImageSubresourceRange {
+                    aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
                     layer_count: 1,
                 },
-                image_offset: VkOffset3D::default(),
-                image_extent: VkExtent3D {
-                    width: self.width,
-                    height: self.height,
-                    depth: 1,
+            };
+            unsafe {
+                (self.device.fns().cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    if initialized {
+                        VK_PIPELINE_STAGE_TRANSFER_BIT
+                    } else {
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                    },
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    1,
+                    &to_direct_dst,
+                );
+            }
+
+            let direct_regions = [
+                VkImageCopy {
+                    src_subresource: VkImageSubresourceLayers {
+                        aspect_mask: VK_IMAGE_ASPECT_PLANE_0_BIT,
+                        mip_level: 0,
+                        base_array_layer: output_layer,
+                        layer_count: 1,
+                    },
+                    src_offset: VkOffset3D::default(),
+                    dst_subresource: VkImageSubresourceLayers {
+                        aspect_mask: VK_IMAGE_ASPECT_PLANE_0_BIT,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    dst_offset: VkOffset3D::default(),
+                    extent: VkExtent3D {
+                        width: self.width,
+                        height: self.height,
+                        depth: 1,
+                    },
                 },
-            },
-            VkBufferImageCopy {
-                buffer_offset: luma_bytes,
-                buffer_row_length: self.chroma_stride,
-                buffer_image_height: self.chroma_height,
-                image_subresource: VkImageSubresourceLayers {
-                    aspect_mask: VK_IMAGE_ASPECT_PLANE_1_BIT,
-                    mip_level: 0,
-                    base_array_layer: output_layer,
+                VkImageCopy {
+                    src_subresource: VkImageSubresourceLayers {
+                        aspect_mask: VK_IMAGE_ASPECT_PLANE_1_BIT,
+                        mip_level: 0,
+                        base_array_layer: output_layer,
+                        layer_count: 1,
+                    },
+                    src_offset: VkOffset3D::default(),
+                    dst_subresource: VkImageSubresourceLayers {
+                        aspect_mask: VK_IMAGE_ASPECT_PLANE_1_BIT,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    dst_offset: VkOffset3D::default(),
+                    extent: VkExtent3D {
+                        width: self.width.div_ceil(2),
+                        height: self.chroma_height,
+                        depth: 1,
+                    },
+                },
+            ];
+            unsafe {
+                (self.device.fns().cmd_copy_image)(
+                    self.command_buffer,
+                    self.output_image,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    direct_image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    direct_regions.len() as u32,
+                    direct_regions.as_ptr(),
+                );
+            }
+
+            let direct_to_src = VkImageMemoryBarrier {
+                s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                p_next: ptr::null(),
+                src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+                old_layout: VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                new_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+                image: direct_image,
+                subresource_range: VkImageSubresourceRange {
+                    aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
                     layer_count: 1,
                 },
-                image_offset: VkOffset3D::default(),
-                image_extent: VkExtent3D {
-                    width: self.width.div_ceil(2),
-                    height: self.chroma_height,
-                    depth: 1,
+            };
+            unsafe {
+                (self.device.fns().cmd_pipeline_barrier)(
+                    self.command_buffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    0,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    1,
+                    &direct_to_src,
+                );
+            }
+        } else {
+            let luma_bytes = (self.luma_stride as u64) * (self.height as u64);
+            let regions = [
+                VkBufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length: self.luma_stride,
+                    buffer_image_height: self.height,
+                    image_subresource: VkImageSubresourceLayers {
+                        aspect_mask: VK_IMAGE_ASPECT_PLANE_0_BIT,
+                        mip_level: 0,
+                        base_array_layer: output_layer,
+                        layer_count: 1,
+                    },
+                    image_offset: VkOffset3D::default(),
+                    image_extent: VkExtent3D {
+                        width: self.width,
+                        height: self.height,
+                        depth: 1,
+                    },
                 },
-            },
-        ];
-        unsafe {
-            (self.device.fns().cmd_copy_image_to_buffer)(
-                self.command_buffer,
-                self.output_image,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                self.staging_buffer,
-                regions.len() as u32,
-                regions.as_ptr(),
-            );
+                VkBufferImageCopy {
+                    buffer_offset: luma_bytes,
+                    buffer_row_length: self.chroma_stride,
+                    buffer_image_height: self.chroma_height,
+                    image_subresource: VkImageSubresourceLayers {
+                        aspect_mask: VK_IMAGE_ASPECT_PLANE_1_BIT,
+                        mip_level: 0,
+                        base_array_layer: output_layer,
+                        layer_count: 1,
+                    },
+                    image_offset: VkOffset3D::default(),
+                    image_extent: VkExtent3D {
+                        width: self.width.div_ceil(2),
+                        height: self.chroma_height,
+                        depth: 1,
+                    },
+                },
+            ];
+            unsafe {
+                (self.device.fns().cmd_copy_image_to_buffer)(
+                    self.command_buffer,
+                    self.output_image,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    self.staging_buffer,
+                    regions.len() as u32,
+                    regions.as_ptr(),
+                );
+            }
         }
 
         let quiescent_layout = if self.coincide {
@@ -2157,6 +2713,16 @@ impl DecoderState {
         }
         self.needs_reset = false;
 
+        if let Some(surface) = direct_surface {
+            surface.mark_initialized()?;
+            return Ok(DecodedPicture::Direct(VulkanVideoFrameStorage {
+                surface,
+                width: self.width,
+                height: self.height,
+                pts: None,
+            }));
+        }
+
         let width = self.width as usize;
         let height = self.height as usize;
         let lstride = self.luma_stride as usize;
@@ -2218,7 +2784,7 @@ impl DecoderState {
             }
         }
 
-        Ok(VideoFrame {
+        Ok(DecodedPicture::Readback(VideoFrame {
             pts: None,
             planes: vec![
                 VideoPlane {
@@ -2234,7 +2800,7 @@ impl DecoderState {
                     data: frame_v,
                 },
             ],
-        })
+        }))
     }
 }
 

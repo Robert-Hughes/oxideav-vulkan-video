@@ -579,6 +579,8 @@ pub const VK_IMAGE_TYPE_2D: i32 = 1;
 pub const VK_IMAGE_TILING_OPTIMAL: i32 = 0;
 /// `VK_SHARING_MODE_EXCLUSIVE = 0`.
 pub const VK_SHARING_MODE_EXCLUSIVE: i32 = 0;
+/// `VK_SHARING_MODE_CONCURRENT = 1`.
+pub const VK_SHARING_MODE_CONCURRENT: i32 = 1;
 /// `VK_SAMPLE_COUNT_1_BIT = 0x1`.
 pub const VK_SAMPLE_COUNT_1_BIT: VkFlags = 0x00000001;
 /// `VK_IMAGE_VIEW_TYPE_2D = 1`.
@@ -1689,6 +1691,17 @@ pub struct VkBufferImageCopy {
     pub image_extent: VkExtent3D,
 }
 
+/// `VkImageCopy`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct VkImageCopy {
+    pub src_subresource: VkImageSubresourceLayers,
+    pub src_offset: VkOffset3D,
+    pub dst_subresource: VkImageSubresourceLayers,
+    pub dst_offset: VkOffset3D,
+    pub extent: VkExtent3D,
+}
+
 /// `VkImageMemoryBarrier`.
 #[repr(C)]
 pub struct VkImageMemoryBarrier {
@@ -2042,6 +2055,16 @@ pub type FnVkCmdCopyImageToBuffer = unsafe extern "C" fn(
     dst_buffer: VkBuffer,
     region_count: u32,
     p_regions: *const VkBufferImageCopy,
+);
+
+pub type FnVkCmdCopyImage = unsafe extern "C" fn(
+    command_buffer: VkCommandBuffer,
+    src_image: VkImage,
+    src_image_layout: i32,
+    dst_image: VkImage,
+    dst_image_layout: i32,
+    region_count: u32,
+    p_regions: *const VkImageCopy,
 );
 
 pub type FnVkQueueSubmit = unsafe extern "C" fn(

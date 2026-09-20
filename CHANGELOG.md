@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace the single-IDR H.264 decode path with streaming Annex-B access-unit assembly and the shared `oxideav-h264` picture frontend for slice parsing, POC, MMCO/sliding-window DPB state and output ordering.
 - Map live H.264 DPB keys to Vulkan DPB slots, submit real per-picture/reference metadata, preserve DPB image contents across pictures, reset video-session state only when required, and read back the reconstructed layer selected for each picture.
 - Add a 12-frame High-profile IDR/P/B regression fixture; GTX 1080 Vulkan Video output matches the ffmpeg-decoded I420 reference byte-for-byte.
+- Add an explicit same-device GPU-only H.264 output path: applications can import their existing Vulkan device/queues and receive retained NV12 `HardwareVideoFrame` leases backed by reusable Vulkan images, avoiding CPU pixel readback.
 
 ### Fixed
 

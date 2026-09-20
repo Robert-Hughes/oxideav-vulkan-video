@@ -314,3 +314,54 @@ fn make_with_device_rejects_non_video_queue_family() {
     }
     drop(dec);
 }
+
+#[test]
+fn direct_decoder_emits_retained_gpu_frame_on_imported_device() {
+    let Some(bytes) = read_fixture() else {
+        return;
+    };
+    let Some(app_instance) = try_init_instance() else {
+        return;
+    };
+    let Some((app_device, pd_handle, qfi)) = create_app_device(&app_instance) else {
+        return;
+    };
+
+    let params = CodecParameters::video(CodecId::new("h264"));
+    let _env_guard = ENV_HOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var("OXIDEAV_VK_SKIP_SUBMIT");
+    let ext = ExternalDevice::new(app_instance.handle(), pd_handle, app_device.handle(), qfi)
+        .with_consumer_queue_family_index(qfi);
+
+    // SAFETY: the application-owned instance/device/queue remain live for the
+    // entire decoder and hardware-frame lifetime in this test.
+    let mut dec = unsafe { H264VkDecoder::make_direct_with_device(&params, ext) }
+        .expect("construct direct decoder on imported device");
+    dec.send_packet(&make_packet(bytes))
+        .expect("submit direct H.264 picture");
+    dec.flush().expect("flush direct decoder");
+
+    let lease = dec
+        .receive_frame_lease()
+        .expect("direct decoder must emit a hardware frame");
+    assert!(lease.is_hardware_video());
+    let hardware = lease.as_hardware_video().expect("hardware frame lease");
+    assert_eq!(hardware.backend(), "vulkan-video");
+    assert_eq!(hardware.pixel_format(), oxideav_core::PixelFormat::Nv12);
+    assert_eq!(hardware.pts(), Some(0));
+
+    let storage = hardware
+        .downcast_ref::<oxideav_vulkan_video::decoder::VulkanVideoFrameStorage>()
+        .expect("Vulkan direct storage type");
+    assert!(!storage.image().is_null());
+    assert_eq!(storage.device(), app_device.handle());
+
+    // The retained frame owns the direct presentation surface independently of
+    // decoder session teardown; the application-owned VkDevice remains live.
+    drop(dec);
+    assert!(!storage.image().is_null());
+    drop(lease);
+
+    let q = app_device.queue(qfi);
+    assert!(!q.handle().is_null());
+}

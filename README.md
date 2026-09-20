@@ -111,7 +111,7 @@ unregistering them.
 
 | Codec | Decode | Encode |
 |-------|--------|--------|
-| H.264 | Streaming Annex-B Baseline/Main/High 8-bit 4:2:0 progressive decode: I/P/B pictures, shared H.264 POC/DPB frontend, Vulkan reference-slot mapping, NV12 readback; unsupported stream tools fail explicitly | planned |
+| H.264 | Streaming Annex-B Baseline/Main/High 8-bit 4:2:0 progressive decode: I/P/B pictures, shared H.264 POC/DPB frontend, Vulkan reference-slot mapping, CPU NV12 readback or explicit retained GPU-only NV12 frame leases on an imported device; unsupported stream tools fail explicitly | planned |
 | HEVC  | Capability query wired; session/decode pipeline planned | planned |
 | AV1   | Capability query wired; session/decode pipeline planned | planned |
 | VP9   | — | — |
