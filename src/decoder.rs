@@ -128,7 +128,12 @@ use crate::video::{query_video_decode_h264_capabilities, VideoSession};
 // ─────────────────────────── helpers ─────────────────────────────────────────
 
 fn vk_err(op: &'static str, r: i32) -> Error {
-    Error::other(format!("{op} returned VkResult({r})"))
+    let message = format!("{op} returned VkResult({r})");
+    if r == -4 {
+        Error::device_lost(message)
+    } else {
+        Error::other(message)
+    }
 }
 
 /// Round `v` up to the nearest multiple of `align`. Caller ensures
