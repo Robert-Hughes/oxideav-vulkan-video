@@ -1094,6 +1094,7 @@ impl H264VkDecoder {
         self.au_assembler.reset();
         self.frontend.reset();
         self.dpb_slots.clear();
+        self.active_slots.clear();
         self.output_dpb = DpbOutput::new(4, 4);
         self.ready.clear();
         self.eof = false;
